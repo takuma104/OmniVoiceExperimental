@@ -183,6 +183,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Number of worker processes to spawn per GPU.",
     )
     parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=8,
+        help="Number of samples to encode in a single batch per worker.",
+    )
+    parser.add_argument(
         "--loader_workers",
         type=int,
         default=2,
@@ -245,52 +251,84 @@ def process_init(rank_queue, tokenizer_path):
     logging.debug(f"Tokenizer loaded successfully on device {worker_device}")
 
 
-def process_single_sample(sample: dict[str, Any]) -> dict[str, Any]:
+def process_batch(samples: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """
-    Single-sample processing function executed in worker processes.
-    Skips invalid samples during streaming processing.
+    Batch processing function executed in worker processes.
+    Encodes multiple audio samples in a single tokenizer call.
     """
-    try:
-        audio_tensor = sample.get("audio", None)  # shape (1, T)
+    results = []
+    # Separate valid and invalid samples
+    valid_indices = []
+    wav_inputs = []
+    keys = []
+
+    for i, sample in enumerate(samples):
+        audio_tensor = sample.get("audio", None)
         if audio_tensor is None:
-            raise ValueError("Sample missing 'audio' field")
+            results.append({
+                "status": "error",
+                "key": sample.get("label", {}).get("id", "unknown"),
+                "audio_tokens": None,
+                "metadata": None,
+                "error_msg": "Sample missing 'audio' field",
+            })
+            continue
+        valid_indices.append(i)
+        keys.append(sample["label"]["id"])
+        wav_inputs.append(audio_tensor.squeeze().numpy())
 
+    if not wav_inputs:
+        return results
+
+    try:
         with torch.inference_mode():
-            key = sample["label"]["id"]
-            wav_input = audio_tensor.squeeze().numpy()
-            # Qwen3TTSTokenizerV2
-            enc_out = worker_tokenizer.encode([wav_input], sr=AUDIO_SAMPLE_RATE)
+            enc_out = worker_tokenizer.encode(wav_inputs, sr=AUDIO_SAMPLE_RATE)
 
-            # audio_codes is a list of (T_i, C) tensors; take first, transpose to (C, T)
-            audio_tokens = enc_out.audio_codes[0].T
+        # Process each encoded result
+        for j, idx in enumerate(valid_indices):
+            sample = samples[idx]
+            try:
+                # audio_codes is a list of (T_i, C) tensors; transpose to (C, T)
+                audio_tokens = enc_out.audio_codes[j].T
 
-            assert len(audio_tokens.shape) == 2
-            assert audio_tokens.size(0) == 16
+                assert len(audio_tokens.shape) == 2
+                assert audio_tokens.size(0) == 16
 
-            num_tokens = audio_tokens.size(1)
-            metadata = sample["label"]
-            metadata["num_tokens"] = num_tokens
+                num_tokens = audio_tokens.size(1)
+                metadata = sample["label"]
+                metadata["num_tokens"] = num_tokens
 
-            # Convert to numpy format for subsequent serialization (int16 to save space)
-            audio_tokens_np = audio_tokens.to(torch.int16).cpu().numpy()
+                audio_tokens_np = audio_tokens.to(torch.int16).cpu().numpy()
 
-            return {
-                "status": "success",
-                "key": key,
-                "audio_tokens": audio_tokens_np,
-                "metadata": metadata,
-                "error_msg": None,
-            }
+                results.append({
+                    "status": "success",
+                    "key": keys[j],
+                    "audio_tokens": audio_tokens_np,
+                    "metadata": metadata,
+                    "error_msg": None,
+                })
+            except Exception as e:
+                logging.error(f"Failed to process sample {keys[j]}: {e}")
+                results.append({
+                    "status": "error",
+                    "key": keys[j],
+                    "audio_tokens": None,
+                    "metadata": None,
+                    "error_msg": str(e),
+                })
     except Exception as e:
-        sample_id = sample.get("label", {}).get("id", "unknown")
-        logging.error(f"Failed to process sample {sample_id}: {e}")
-        return {
-            "status": "error",
-            "key": sample_id,
-            "audio_tokens": None,
-            "metadata": None,
-            "error_msg": str(e),
-        }
+        # Batch encode failed -- fall back to reporting all as errors
+        logging.error(f"Batch encode failed: {e}")
+        for j, idx in enumerate(valid_indices):
+            results.append({
+                "status": "error",
+                "key": keys[j],
+                "audio_tokens": None,
+                "metadata": None,
+                "error_msg": str(e),
+            })
+
+    return results
 
 
 def _normalise_value(value: Any) -> Any:
@@ -748,20 +786,31 @@ def main() -> None:
                 done, _ = wait(futures, return_when=FIRST_COMPLETED)
                 for f in done:
                     futures.discard(f)
-                    result = f.result()
-                    main_progress.update(1)
-                    handle_result(result)
+                    batch_results = f.result()
+                    for result in batch_results:
+                        main_progress.update(1)
+                        handle_result(result)
                     main_progress.set_postfix(
                         Samples=processed_count,
                         Errors=error_count,
                     )
 
-            # Stream samples from DataLoader
+            # Stream samples from DataLoader, batching before submit
+            batch = []
             for sample in dataloader:
+                batch.append(sample)
+                if len(batch) >= args.batch_size:
+                    if len(futures) >= max_pending:
+                        drain_completed()
+                    future = executor.submit(process_batch, batch)
+                    futures.add(future)
+                    batch = []
+
+            # Submit remaining samples
+            if batch:
                 if len(futures) >= max_pending:
                     drain_completed()
-
-                future = executor.submit(process_single_sample, sample)
+                future = executor.submit(process_batch, batch)
                 futures.add(future)
 
             # Process remaining futures
