@@ -30,8 +30,8 @@ classifiers = [
     "Programming Language :: Python :: 3",
 ]
 dependencies = [
-    "torch==2.8.*",
-    "torchaudio==2.8.*",
+    "torch==2.11.*",
+    "torchaudio",
     "transformers",
     "accelerate",
     "pydub",
@@ -41,6 +41,8 @@ dependencies = [
     "numpy",
     "soundfile",
     "qwen-tts>=0.1.1",
+    "datasets>=4.8.4",
+    "torchcodec",
 ]
 
 [project.optional-dependencies]
