@@ -696,10 +696,19 @@ def main() -> None:
     shard_idx = 0
     shard_sample_count = 0
     shard_duration = 0.0
-    shard_manifest = {}  # shard_idx -> (tar_path, jsonl_path, count, duration)
+    shard_count = 0  # number of shards written to manifest
+    manifest_file = open(manifest_path, "w", encoding="utf-8")
 
     tar_writer = None
     jsonl_file = None
+
+    def append_shard_to_manifest(idx, sample_count, duration):
+        nonlocal shard_count
+        tar_path = os.path.abspath(tar_output_pattern % idx)
+        jsonl_path = os.path.abspath(jsonl_output_pattern % idx)
+        manifest_file.write(f"{tar_path} {jsonl_path} {sample_count} {duration:.3f}\n")
+        manifest_file.flush()
+        shard_count += 1
 
     def open_new_shard():
         nonlocal tar_writer, jsonl_file, shard_idx, shard_sample_count, shard_duration
@@ -710,12 +719,7 @@ def main() -> None:
         # Record manifest for the previous shard
         if shard_idx > 0 and shard_sample_count > 0:
             prev_idx = shard_idx - 1
-            shard_manifest[prev_idx] = (
-                os.path.abspath(tar_output_pattern % prev_idx),
-                os.path.abspath(jsonl_output_pattern % prev_idx),
-                shard_sample_count,
-                shard_duration,
-            )
+            append_shard_to_manifest(prev_idx, shard_sample_count, shard_duration)
         tar_fname = tar_output_pattern % shard_idx
         jsonl_fname = jsonl_output_pattern % shard_idx
         tar_writer = wds.TarWriter(tar_fname)
@@ -830,18 +834,8 @@ def main() -> None:
         # Record the last shard in the manifest
         if shard_idx > 0 and shard_sample_count > 0:
             last_idx = shard_idx - 1
-            shard_manifest[last_idx] = (
-                os.path.abspath(tar_output_pattern % last_idx),
-                os.path.abspath(jsonl_output_pattern % last_idx),
-                shard_sample_count,
-                shard_duration,
-            )
-
-    # Write manifest file (data.lst)
-    with open(manifest_path, "w", encoding="utf-8") as mf:
-        for idx in sorted(shard_manifest.keys()):
-            tar_path, jsonl_path, count, duration = shard_manifest[idx]
-            mf.write(f"{tar_path} {jsonl_path} {count} {duration:.3f}\n")
+            append_shard_to_manifest(last_idx, shard_sample_count, shard_duration)
+        manifest_file.close()
 
     # Output final statistics
     total_failed = error_count + write_error_count
@@ -849,7 +843,7 @@ def main() -> None:
         f"Processing Complete - Successful: {processed_count}, Failed: {total_failed}, "
         f"Shards written: {shard_idx}"
     )
-    logging.info(f"Manifest written to: {manifest_path} ({len(shard_manifest)} shards)")
+    logging.info(f"Manifest written to: {manifest_path} ({shard_count} shards)")
     if total_failed > 0:
         logging.info(f"Error details: {error_log_path}")
     if failed_ids and args.skip_errors:
