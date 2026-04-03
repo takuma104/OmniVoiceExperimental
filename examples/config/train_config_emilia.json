@@ -25,8 +25,8 @@
     "warmup_ratio": 0.03,
     "warmup_steps": 0,
 
-    "batch_tokens": 8192,
-    "gradient_accumulation_steps": 1,
+    "batch_tokens": 4096,
+    "gradient_accumulation_steps": 2,
     "num_workers": 4,
 
     "mixed_precision": "bf16",

@@ -87,11 +87,20 @@ class OmniTrainer:
             ] = 1
 
         # 4. Prepare with Accelerator
-        (self.model, self.optimizer, self.lr_scheduler,) = self.accelerator.prepare(
+        (
             self.model,
             self.optimizer,
             self.lr_scheduler,
+            self.train_dataloader,
+        ) = self.accelerator.prepare(
+            self.model,
+            self.optimizer,
+            self.lr_scheduler,
+            self.train_dataloader,
         )
+
+        if self.eval_dataloader is not None:
+            self.eval_dataloader = self.accelerator.prepare(self.eval_dataloader)
 
         self.global_step = 0
         self.epoch = 0
