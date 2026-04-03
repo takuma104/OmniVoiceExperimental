@@ -42,10 +42,8 @@ import torch.nn.functional as F
 import torchaudio
 from torch.nn.attention.flex_attention import create_block_mask
 from transformers import (
-    AutoFeatureExtractor,
     AutoModel,
     AutoTokenizer,
-    HiggsAudioV2TokenizerModel,
     PretrainedConfig,
     PreTrainedModel,
 )
@@ -71,6 +69,8 @@ from omnivoice.utils.voice_design import (
     _INSTRUCT_ZH_TO_EN,
     _ZH_RE,
 )
+
+from qwen_tts import Qwen3TTSTokenizer
 
 logger = logging.getLogger(__name__)
 
@@ -226,6 +226,16 @@ class OmniVoice(PreTrainedModel):
         self.sampling_rate = None
         self._asr_pipe = None
 
+    @property
+    def audio_frame_rate(self) -> float:
+        """Audio tokenizer frame rate (tokens per second)."""
+        if self.audio_tokenizer is None:
+            raise RuntimeError("Audio tokenizer is not loaded.")
+        return (
+            self.audio_tokenizer.input_sample_rate
+            / self.audio_tokenizer.encode_downsample_rate
+        )
+
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, *args, **kwargs):
         train_mode = kwargs.pop("train", False)
@@ -257,22 +267,16 @@ class OmniVoice(PreTrainedModel):
                 audio_tokenizer_path = os.path.join(resolved_path, "audio_tokenizer")
 
                 if not os.path.isdir(audio_tokenizer_path):
-                    # Fallback to the HuggingFace Hub path of transformers'
-                    # HiggsAudioV2Tokenizer if the local subdirectory doesn't exist.
-                    audio_tokenizer_path = "eustlb/higgs-audio-v2-tokenizer"
+                    audio_tokenizer_path = "Qwen/Qwen3-TTS-Tokenizer-12Hz"
 
-                # higgs-audio-v2-tokenizer does not support MPS (output channels > 65536)
                 tokenizer_device = (
                     "cpu" if str(model.device).startswith("mps") else model.device
                 )
-                model.audio_tokenizer = HiggsAudioV2TokenizerModel.from_pretrained(
+                model.audio_tokenizer = Qwen3TTSTokenizer.from_pretrained(
                     audio_tokenizer_path, device_map=tokenizer_device
                 )
-                model.feature_extractor = AutoFeatureExtractor.from_pretrained(
-                    audio_tokenizer_path
-                )
 
-                model.sampling_rate = model.feature_extractor.sampling_rate
+                model.sampling_rate = model.audio_tokenizer.input_sample_rate
 
                 model.duration_estimator = RuleDurationEstimator()
 
@@ -552,7 +556,7 @@ class OmniVoice(PreTrainedModel):
         )
 
         short_idx, long_idx = full_task.get_indices(
-            gen_config, self.audio_tokenizer.config.frame_rate
+            gen_config, self.audio_frame_rate
         )
 
         results = [None] * full_task.batch_size
@@ -660,14 +664,17 @@ class OmniVoice(PreTrainedModel):
             ref_text = self.transcribe((ref_wav, self.sampling_rate))
             logger.debug("Auto-transcribed ref_text: %s", ref_text)
 
-        chunk_size = self.audio_tokenizer.config.hop_length
-        clip_size = int(ref_wav.size(-1) % chunk_size)
+        hop_length = self.audio_tokenizer.encode_downsample_rate
+        clip_size = int(ref_wav.size(-1) % hop_length)
         ref_wav = ref_wav[:, :-clip_size] if clip_size > 0 else ref_wav
-        ref_audio_tokens = self.audio_tokenizer.encode(
-            ref_wav.unsqueeze(0).to(self.audio_tokenizer.device),
-        ).audio_codes.squeeze(
-            0
-        )  # (C, T)
+        # Qwen3TTSTokenizerV2: encode expects (B, seq_len) and padding_mask (B, seq_len)
+        wav_input = ref_wav.to(self.audio_tokenizer.device)  # (1, seq_len)
+        padding_mask = torch.ones_like(wav_input, dtype=torch.long)
+        enc_out = self.audio_tokenizer.encode(
+            wav_input, padding_mask=padding_mask
+        )
+        # enc_out.audio_codes is a list of (T_i, C) tensors; take first batch item
+        ref_audio_tokens = enc_out.audio_codes[0].T  # (C, T)
 
         if preprocess_prompt:
             ref_text = add_punctuation(ref_text)
@@ -696,16 +703,25 @@ class OmniVoice(PreTrainedModel):
         tokenizer_device = self.audio_tokenizer.device
         if isinstance(tokens, list):
             chunk_audios = [
-                self.audio_tokenizer.decode(t.to(tokenizer_device).unsqueeze(0))
+                # Qwen3TTSTokenizerV2: decode expects (B, T, C); tokens are (C, T)
+                # Output audio_values[0] is 1D; unsqueeze to (1, T) for cross_fade_chunks
+                self.audio_tokenizer.decode(
+                    t.to(tokenizer_device).T.unsqueeze(0)
+                )
                 .audio_values[0]
+                .unsqueeze(0)
                 .cpu()
                 for t in tokens
             ]
             audio_waveform = cross_fade_chunks(chunk_audios, self.sampling_rate)
         else:
+            # Output audio_values[0] is 1D; unsqueeze to (1, T)
             audio_waveform = (
-                self.audio_tokenizer.decode(tokens.to(tokenizer_device).unsqueeze(0))
+                self.audio_tokenizer.decode(
+                    tokens.to(tokenizer_device).T.unsqueeze(0)
+                )
                 .audio_values[0]
+                .unsqueeze(0)
                 .cpu()
             )
 
@@ -776,7 +792,7 @@ class OmniVoice(PreTrainedModel):
             avg_tokens_per_char = task.target_lens[i] / len(task.texts[i])
             text_chunk_len = int(
                 gen_config.audio_chunk_duration
-                * self.audio_tokenizer.config.frame_rate
+                * self.audio_frame_rate
                 / avg_tokens_per_char
             )
             chunks = chunk_text_punctuation(
@@ -976,7 +992,7 @@ class OmniVoice(PreTrainedModel):
         # and compute speed ratio so chunked generation scales proportionally.
         speed_list: Optional[List[float]] = None
         if durations is not None:
-            frame_rate = self.audio_tokenizer.config.frame_rate
+            frame_rate = self.audio_frame_rate
             speed_list = []
             for i in range(batch_size):
                 if durations[i] is not None:
@@ -1005,9 +1021,9 @@ class OmniVoice(PreTrainedModel):
     def _estimate_target_tokens(self, text, ref_text, num_ref_audio_tokens, speed=1.0):
         """Estimate number of target audio tokens."""
         if num_ref_audio_tokens is None or ref_text is None or len(ref_text) == 0:
-            # Fall back to a simple heuristic
+            # Fall back to a simple heuristic (~1s of speech at 12.5 Hz)
             ref_text = "Nice to meet you."
-            num_ref_audio_tokens = 25
+            num_ref_audio_tokens = 4
 
         est = self.duration_estimator.estimate_duration(
             text, ref_text, num_ref_audio_tokens

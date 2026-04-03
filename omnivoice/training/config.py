@@ -35,13 +35,13 @@ class TrainingConfig:
 
     # Model Specific
     llm_name_or_path: str = "Qwen/Qwen3-0.6B"
-    audio_vocab_size: int = 1025  # valid vocab size + 1 (mask token)
-    audio_mask_id: int = 1024  # 1024 is the 1025-th token
-    num_audio_codebook: int = 8
+    audio_vocab_size: int = 2049  # valid vocab size (2048) + 1 (mask token)
+    audio_mask_id: int = 2048  # 2048 is the 2049-th token
+    num_audio_codebook: int = 16
 
     # Model Training Specific
     audio_codebook_weights: List[float | int] = field(
-        default_factory=lambda: [8, 8, 6, 6, 4, 4, 2, 2]
+        default_factory=lambda: [16, 14, 12, 10, 8, 8, 6, 6, 4, 4, 4, 4, 2, 2, 2, 2]
     )
     drop_cond_ratio: float = 0.1
     prompt_ratio_range: Tuple[float, float] = field(default_factory=lambda: (0.0, 0.3))

@@ -70,7 +70,7 @@ import torchaudio
 import webdataset as wds
 from torch.utils.data import DataLoader, IterableDataset
 from tqdm.auto import tqdm
-from transformers import AutoFeatureExtractor, HiggsAudioV2TokenizerModel
+from qwen_tts import Qwen3TTSTokenizer
 
 from omnivoice.data.dataset import JsonlDatasetReader, WebDatasetReader
 from omnivoice.utils.common import str2bool
@@ -79,11 +79,10 @@ warnings.filterwarnings(
     "ignore", category=FutureWarning, module="torch.nn.utils.weight_norm"
 )
 
-HIGGS_INPUT_SAMPLE_RATE = 24_000
+AUDIO_SAMPLE_RATE = 24_000
 
 # Global variables: Store tokenizer and device for each worker process
 worker_tokenizer = None
-worker_feature_extractor = None
 worker_noise_sampler = None
 worker_rir_sampler = None
 
@@ -126,7 +125,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--tokenizer_path",
         type=str,
-        default="eustlb/higgs-audio-v2-tokenizer",
+        default="Qwen/Qwen3-TTS-Tokenizer-12Hz",
         help="Path to audio tokenizer.",
     )
     parser.add_argument(
@@ -297,7 +296,7 @@ def process_init(rank_queue, tokenizer_path, noise_manifest=None, rir_manifest=N
     Initialization function for each worker process.
     Assigns a specific GPU to the process and loads the tokenizer.
     """
-    global worker_tokenizer, worker_feature_extractor, worker_noise_sampler, worker_rir_sampler
+    global worker_tokenizer, worker_noise_sampler, worker_rir_sampler
 
     # Configure worker process logging
     formatter = (
@@ -316,8 +315,7 @@ def process_init(rank_queue, tokenizer_path, noise_manifest=None, rir_manifest=N
 
     logging.debug(f"Worker process initialized with device: {worker_device}")
     # Load tokenizer onto the specified device
-    worker_feature_extractor = AutoFeatureExtractor.from_pretrained(tokenizer_path)
-    worker_tokenizer = HiggsAudioV2TokenizerModel.from_pretrained(
+    worker_tokenizer = Qwen3TTSTokenizer.from_pretrained(
         tokenizer_path, device_map=worker_device
     )
     logging.debug(f"Tokenizer loaded successfully on device {worker_device}")
@@ -328,7 +326,7 @@ def process_init(rank_queue, tokenizer_path, noise_manifest=None, rir_manifest=N
             with open(noise_manifest, "r") as f:
                 tars = [l.strip().split()[0] for l in f if l.strip()]
             worker_noise_sampler = SimpleWorkerSampler(
-                tars, sample_rate=HIGGS_INPUT_SAMPLE_RATE
+                tars, sample_rate=AUDIO_SAMPLE_RATE
             )
             logging.debug("Noise sampler initialized.")
         except Exception as e:
@@ -339,7 +337,7 @@ def process_init(rank_queue, tokenizer_path, noise_manifest=None, rir_manifest=N
             with open(rir_manifest, "r") as f:
                 tars = [l.strip().split()[0] for l in f if l.strip()]
             worker_rir_sampler = SimpleWorkerSampler(
-                tars, sample_rate=HIGGS_INPUT_SAMPLE_RATE
+                tars, sample_rate=AUDIO_SAMPLE_RATE
             )
             logging.debug("RIR sampler initialized.")
         except Exception as e:
@@ -411,17 +409,17 @@ def process_single_sample(sample: dict[str, Any]) -> dict[str, Any]:
         with torch.inference_mode():
             key = sample["label"]["id"]
 
-            inputs = worker_feature_extractor(
-                raw_audio=audio_tensor.squeeze(0).numpy(),
-                sampling_rate=HIGGS_INPUT_SAMPLE_RATE,
-                return_tensors="pt",
-            ).to(worker_tokenizer.device)
-            audio_tokens = worker_tokenizer.encode(
-                inputs["input_values"],
-            ).audio_codes.squeeze(0)
+            # Qwen3TTSTokenizerV2: encode expects (B, seq_len) with padding_mask
+            wav_input = audio_tensor.to(worker_tokenizer.device)  # (1, T)
+            padding_mask = torch.ones_like(wav_input, dtype=torch.long)
+            enc_out = worker_tokenizer.encode(
+                wav_input, padding_mask=padding_mask
+            )
+            # audio_codes is a list of (T_i, C) tensors; transpose to (C, T)
+            audio_tokens = enc_out.audio_codes[0].T
 
             assert len(audio_tokens.shape) == 2
-            assert audio_tokens.size(0) == 8
+            assert audio_tokens.size(0) == 16
 
             num_tokens = audio_tokens.size(1)
             metadata = sample["label"]
@@ -429,7 +427,7 @@ def process_single_sample(sample: dict[str, Any]) -> dict[str, Any]:
 
             if enable_aug:
                 clean_token_idx = math.ceil(
-                    clean_sample_idx / worker_tokenizer.config.hop_length
+                    clean_sample_idx / worker_tokenizer.encode_downsample_rate
                 )
                 metadata["clean_start_token_idx"] = clean_token_idx
 
@@ -532,7 +530,7 @@ def main() -> None:
         total_samples = count_lines(args.input_jsonl)
         base_dataset = JsonlDatasetReader(
             args.input_jsonl,
-            sample_rate=HIGGS_INPUT_SAMPLE_RATE,
+            sample_rate=AUDIO_SAMPLE_RATE,
             shuffle=args.shuffle,
             shuffle_seed=args.shuffle_seed,
         )
@@ -574,7 +572,7 @@ def main() -> None:
         )
         base_dataset = WebDatasetReader(
             manifests=manifests,
-            sample_rate=HIGGS_INPUT_SAMPLE_RATE,
+            sample_rate=AUDIO_SAMPLE_RATE,
             evaluation=True,
         )
 
@@ -583,7 +581,7 @@ def main() -> None:
         base_iterable=base_dataset,
         min_len=args.min_length,
         max_len=args.max_length,
-        sr=HIGGS_INPUT_SAMPLE_RATE,
+        sr=AUDIO_SAMPLE_RATE,
     )
     dataloader = DataLoader(
         dataset=filtered_dataset,
