@@ -83,6 +83,12 @@ class TrainingConfig:
     save_steps: int = 10000
     keep_last_n_checkpoints: int = -1
 
+    # Wandb
+    use_wandb: bool = False
+    wandb_project: str = "omnivoice"
+    wandb_run_name: Optional[str] = None
+    wandb_entity: Optional[str] = None
+
     @classmethod
     def from_json(cls, json_path: str):
         with open(json_path, "r") as f:

@@ -39,7 +39,8 @@ dependencies = [
     "tensorboardX",
     "webdataset",
     "numpy",
-    "soundfile"
+    "soundfile",
+    "wandb>=0.25.1",
 ]
 
 [project.optional-dependencies]

@@ -128,10 +128,14 @@ class OmniTrainer:
                 gradient_clipping=self.config.max_grad_norm,
             )
 
+        log_with = "tensorboard"
+        if getattr(self.config, "use_wandb", False):
+            log_with = "wandb"
+
         accelerator = Accelerator(
             gradient_accumulation_steps=self.config.gradient_accumulation_steps,
             mixed_precision=self.config.mixed_precision,
-            log_with="tensorboard",
+            log_with=log_with,
             project_dir=self.config.output_dir,
             step_scheduler_with_optimizer=False,
             kwargs_handlers=[ddp_kwargs, init_kwargs],
@@ -164,7 +168,24 @@ class OmniTrainer:
 
         logger.info(f"Loaded Config: {self.config}")
         set_seed(self.config.seed)
-        accelerator.init_trackers("tensorboard")
+
+        if log_with == "wandb":
+            accelerator.init_trackers(
+                project_name=self.config.wandb_project,
+                config=vars(self.config) if hasattr(self.config, "__dict__") else None,
+                init_kwargs={
+                    "wandb": {
+                        "name": self.config.wandb_run_name,
+                        "entity": self.config.wandb_entity,
+                        "dir": self.config.output_dir,
+                    }
+                },
+            )
+        else:
+            accelerator.init_trackers(
+                "omnivoice",
+                config=vars(self.config) if hasattr(self.config, "__dict__") else None,
+            )
         return accelerator
 
     def create_optimizer_and_scheduler(self):
