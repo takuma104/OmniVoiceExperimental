@@ -43,6 +43,7 @@ dependencies = [
     "qwen-tts>=0.1.1",
     "datasets>=4.8.4",
     "torchcodec",
+    "flash-attn; sys_platform == 'linux'",
 ]
 
 [project.optional-dependencies]
@@ -77,6 +78,9 @@ torch = [
 torchaudio = [
   { index = "pytorch-cuda", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
 ]
+# third-party whl: https://github.com/Dao-AILab/flash-attention/issues/2299
+flash-attn = { url = "https://github.com/lesj0610/flash-attention/releases/download/v2.8.3-cu12-torch2.10-cp312/flash_attn-2.8.3%2Bcu12torch2.10cxx11abiTRUE-cp312-cp312-linux_x86_64.whl" }
+
 
 [[tool.uv.index]]
 name = "pytorch-cuda"
@@ -91,3 +95,4 @@ include = ["omnivoice"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["omnivoice"]
+
