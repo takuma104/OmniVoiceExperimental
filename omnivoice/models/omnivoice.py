@@ -1072,7 +1072,7 @@ class OmniVoice(PreTrainedModel):
         # Build style tokens: <|denoise|> + <|lang_start|>...<|lang_end|>
         #                      + <|instruct_start|>...<|instruct_end|>
         style_text = ""
-        if denoise:
+        if denoise and ref_audio_tokens is not None:
             style_text += "<|denoise|>"
         lang_str = lang if lang else "None"
         instruct_str = instruct if instruct else "None"
@@ -1147,6 +1147,17 @@ class OmniVoice(PreTrainedModel):
 
         B = task.batch_size
 
+        for i in range(B):
+            logger.debug(
+                "Item %d — text: %s | ref_text: %s | instruct: %s | lang: %s | target_tokens: %d",
+                i,
+                task.texts[i],
+                task.ref_texts[i],
+                task.instructs[i],
+                task.langs[i],
+                task.target_lens[i],
+            )
+
         inputs_list = [
             self._prepare_inference_inputs(
                 task.texts[i],
@@ -1189,6 +1200,9 @@ class OmniVoice(PreTrainedModel):
             batch_input_ids[B + i, :, :u_len] = inp["input_ids"][..., -u_len:]
             batch_audio_mask[B + i, :u_len] = inp["audio_mask"][..., -u_len:]
             batch_attention_mask[B + i, :, :u_len, :u_len] = True
+            if max_c_len > u_len:
+                pad_diag = torch.arange(u_len, max_c_len, device=self.device)
+                batch_attention_mask[B + i, :, pad_diag, pad_diag] = True
 
         tokens = torch.full(
             (B, self.config.num_audio_codebook, max(task.target_lens)),
@@ -1507,6 +1521,17 @@ def _combine_text(text, ref_text: Optional[str] = None) -> str:
     chinese_range = r"[\u4e00-\u9fff]"
     pattern = rf"(?<={chinese_range})\s+|\s+(?={chinese_range})"
     full_text = re.sub(pattern, "", full_text)
+
+    # Remove whitespace immediately before special emotion tags (except
+    # [laughter]).  During training these tags have no preceding space, so
+    # the text tokenizer would mis-tokenise them if spaces were present.
+    _EMOTION_TAGS = (
+        r"sigh|confirmation-en|question-en|question-ah|question-oh|"
+        r"question-ei|question-yi|surprise-ah|surprise-oh|surprise-wa|"
+        r"surprise-yo|dissatisfaction-hnn"
+    )
+    full_text = re.sub(rf"\s+(\[({_EMOTION_TAGS})\])", r"\1", full_text)
+
     return full_text
 
 
