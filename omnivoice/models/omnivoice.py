@@ -71,6 +71,7 @@ from omnivoice.utils.voice_design import (
 )
 
 from qwen_tts import Qwen3TTSTokenizer
+from qwen_tts.core.tokenizer_12hz.modeling_qwen3_tts_tokenizer_v2 import Qwen3TTSTokenizerV2EncoderOutput
 
 logger = logging.getLogger(__name__)
 
@@ -120,7 +121,7 @@ class GenerationTask:
     ref_rms: List[Optional[float]]
     speed: Optional[List[float]] = None
 
-    def get_indices(self, config: OmniVoiceGenerationConfig, frame_rate: int):
+    def get_indices(self, config: OmniVoiceGenerationConfig, frame_rate: float):
         threshold = int(config.audio_chunk_threshold * frame_rate)
         short_idx = [i for i, l in enumerate(self.target_lens) if l <= threshold]
         long_idx = [i for i, l in enumerate(self.target_lens) if l > threshold]
@@ -228,13 +229,7 @@ class OmniVoice(PreTrainedModel):
 
     @property
     def audio_frame_rate(self) -> float:
-        """Audio tokenizer frame rate (tokens per second)."""
-        if self.audio_tokenizer is None:
-            raise RuntimeError("Audio tokenizer is not loaded.")
-        return (
-            self.audio_tokenizer.input_sample_rate
-            / self.audio_tokenizer.encode_downsample_rate
-        )
+        return 12.5  # frame_rate for Qwen3-TTS-Tokenizer-12Hz
 
     @classmethod
     def from_pretrained(cls, pretrained_model_name_or_path, *args, **kwargs):
@@ -276,7 +271,7 @@ class OmniVoice(PreTrainedModel):
                     audio_tokenizer_path, device_map=tokenizer_device
                 )
 
-                model.sampling_rate = model.audio_tokenizer.input_sample_rate
+                model.sampling_rate = model.audio_tokenizer.config.input_sample_rate
 
                 model.duration_estimator = RuleDurationEstimator()
 
@@ -664,14 +659,9 @@ class OmniVoice(PreTrainedModel):
             ref_text = self.transcribe((ref_wav, self.sampling_rate))
             logger.debug("Auto-transcribed ref_text: %s", ref_text)
 
-        hop_length = self.audio_tokenizer.encode_downsample_rate
-        clip_size = int(ref_wav.size(-1) % hop_length)
-        ref_wav = ref_wav[:, :-clip_size] if clip_size > 0 else ref_wav
-        # Qwen3TTSTokenizerV2: encode expects (B, seq_len) and padding_mask (B, seq_len)
-        wav_input = ref_wav.to(self.audio_tokenizer.device)  # (1, seq_len)
-        padding_mask = torch.ones_like(wav_input, dtype=torch.long)
+        # Qwen3TTSTokenizer's encode expects a list of 1D numpy arrays
         enc_out = self.audio_tokenizer.encode(
-            wav_input, padding_mask=padding_mask
+            [ref_wav.squeeze().numpy()], sr=self.sampling_rate
         )
         # enc_out.audio_codes is a list of (T_i, C) tensors; take first batch item
         ref_audio_tokens = enc_out.audio_codes[0].T  # (C, T)
@@ -702,28 +692,21 @@ class OmniVoice(PreTrainedModel):
         """
         tokenizer_device = self.audio_tokenizer.device
         if isinstance(tokens, list):
-            chunk_audios = [
+            chunk_audios = []
+            for t in tokens:
                 # Qwen3TTSTokenizerV2: decode expects (B, T, C); tokens are (C, T)
-                # Output audio_values[0] is 1D; unsqueeze to (1, T) for cross_fade_chunks
-                self.audio_tokenizer.decode(
-                    t.to(tokenizer_device).T.unsqueeze(0)
+                wavs, _ = self.audio_tokenizer.decode(
+                    Qwen3TTSTokenizerV2EncoderOutput(t.to(tokenizer_device).T.unsqueeze(0))
                 )
-                .audio_values[0]
-                .unsqueeze(0)
-                .cpu()
-                for t in tokens
-            ]
+                chunk_audios.append(torch.Tensor(wavs[0]).unsqueeze(0).cpu())
+
             audio_waveform = cross_fade_chunks(chunk_audios, self.sampling_rate)
         else:
-            # Output audio_values[0] is 1D; unsqueeze to (1, T)
-            audio_waveform = (
-                self.audio_tokenizer.decode(
-                    tokens.to(tokenizer_device).T.unsqueeze(0)
-                )
-                .audio_values[0]
-                .unsqueeze(0)
-                .cpu()
+            # Qwen3TTSTokenizerV2: decode expects (B, T, C); tokens are (C, T)
+            wavs, _ = self.audio_tokenizer.decode(
+                Qwen3TTSTokenizerV2EncoderOutput(tokens.to(tokenizer_device).T.unsqueeze(0))
             )
+            audio_waveform = torch.Tensor(wavs[0]).unsqueeze(0).cpu()
 
         return self._post_process_audio(
             audio_waveform,
