@@ -41,6 +41,8 @@ dependencies = [
     "numpy",
     "soundfile",
     "wandb>=0.25.1",
+    "ipykernel>=7.2.0",
+    "iprogress>=0.4",
 ]
 
 [project.optional-dependencies]
