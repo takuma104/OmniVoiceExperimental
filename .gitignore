@@ -30,3 +30,4 @@ examples/exp*/
 *.jsonl
 output/
 output
+wandb/

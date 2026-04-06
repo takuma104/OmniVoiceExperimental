@@ -295,6 +295,8 @@ class OmniTrainer:
         logging_start_step = self.global_step
         tr_loss = torch.tensor(0.0).to(self.accelerator.device)
         logging_loss_scalar = 0.0
+        logging_text_tokens = 0
+        logging_audio_tokens = 0
 
         while self.global_step < self.config.steps:
             try:
@@ -309,6 +311,11 @@ class OmniTrainer:
                 batch = next(train_iterator)
 
             batch = _to_device(batch, self.accelerator.device)
+
+            non_padding = (batch["document_ids"] != -1).squeeze(0)  # [L]
+            audio_mask = batch["audio_mask"].squeeze(0).bool()  # [L]
+            logging_audio_tokens += (non_padding & audio_mask).sum().item()
+            logging_text_tokens += (non_padding & ~audio_mask).sum().item()
 
             with self.accelerator.accumulate(self.model):
                 outputs = self.model(**batch)
@@ -360,6 +367,8 @@ class OmniTrainer:
                             "train/grad_norm": grad_norm,
                             "train/epoch": self.epoch,
                             "train/steps_per_sec": steps_per_sec,
+                            "train/text_tokens": logging_text_tokens,
+                            "train/audio_tokens": logging_audio_tokens,
                         }
                         train_logger.log_metrics(step=self.global_step, metrics=logs)
 
