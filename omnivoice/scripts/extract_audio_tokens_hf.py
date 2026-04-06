@@ -48,6 +48,7 @@ Output structure:
 
 import argparse
 import io
+import itertools
 import json
 import logging
 import multiprocessing as mp
@@ -539,6 +540,45 @@ class StreamingLengthFilteredDataset(IterableDataset):
                 continue
 
 
+class _SkipIterableDataset(IterableDataset):
+    """Wraps an IterableDataset, skipping the first ``skip`` items."""
+
+    def __init__(self, base: IterableDataset, skip: int):
+        self.base = base
+        self.skip = skip
+
+    def __iter__(self):
+        return itertools.islice(iter(self.base), self.skip, None)
+
+
+def load_checkpoint(output_dir: Path) -> dict | None:
+    checkpoint_path = output_dir / "checkpoint.json"
+    if not checkpoint_path.exists():
+        return None
+    try:
+        with open(checkpoint_path, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        logging.warning(f"Failed to load checkpoint: {e} -- starting fresh")
+        return None
+
+
+def save_checkpoint(
+    output_dir: Path, completed_shards: int, processed_samples: int, error_count: int
+) -> None:
+    """Atomically write checkpoint state to output_dir/checkpoint.json."""
+    checkpoint_path = output_dir / "checkpoint.json"
+    tmp_path = output_dir / "checkpoint.json.tmp"
+    data = {
+        "completed_shards": completed_shards,
+        "processed_samples": processed_samples,
+        "error_count": error_count,
+    }
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp_path, checkpoint_path)
+
+
 def main() -> None:
     formatter = "%(asctime)s %(levelname)s [%(filename)s:%(lineno)d] %(message)s"
     logging.basicConfig(format=formatter, level=logging.INFO, force=True)
@@ -632,6 +672,48 @@ def main() -> None:
                 f"(total_samples={total_samples})"
             )
 
+    # ── Prepare output paths ──
+    tar_output_pattern = str(Path(args.tar_output_pattern).expanduser())
+    jsonl_output_pattern = str(Path(args.jsonl_output_pattern).expanduser())
+    Path(tar_output_pattern).parent.mkdir(parents=True, exist_ok=True)
+    Path(jsonl_output_pattern).parent.mkdir(parents=True, exist_ok=True)
+
+    # Determine output directory from tar_output_pattern
+    output_dir = Path(tar_output_pattern).parent.parent
+    error_log_path = str(output_dir / "errors.jsonl")
+    manifest_path = str(output_dir / "data.lst")
+
+    # ── Resume support ──
+    checkpoint = load_checkpoint(output_dir)
+    if checkpoint:
+        logging.info(
+            f"Resuming from checkpoint: {checkpoint['completed_shards']} shards done, "
+            f"{checkpoint['processed_samples']} samples already processed"
+        )
+    else:
+        logging.info("No checkpoint found -- starting fresh")
+    file_mode = "a" if checkpoint else "w"
+
+    # Setup error logger (writes to errors.jsonl)
+    error_logger = logging.getLogger("error_log")
+    error_logger.setLevel(logging.ERROR)
+    error_logger.handlers.clear()
+    error_fh = logging.FileHandler(error_log_path, mode=file_mode, encoding="utf-8")
+    error_fh.setFormatter(logging.Formatter("%(message)s"))
+    error_logger.addHandler(error_fh)
+
+    # ── Progress and error tracking ──
+    processed_count = checkpoint["processed_samples"] if checkpoint else 0
+    error_count = checkpoint["error_count"] if checkpoint else 0
+    write_error_count = 0
+    failed_ids = []
+    shard_idx = checkpoint["completed_shards"] if checkpoint else 0
+    shard_sample_count = 0
+    shard_duration = 0.0
+    shard_count = 0  # number of shards written to manifest in this run
+    any_shard_opened = False  # tracks whether open_new_shard() was called this run
+    manifest_file = open(manifest_path, file_mode, encoding="utf-8")
+
     # ── Apply length filter and create DataLoader ──
     filtered_dataset = StreamingLengthFilteredDataset(
         base_iterable=base_dataset,
@@ -640,8 +722,16 @@ def main() -> None:
         sr=AUDIO_SAMPLE_RATE,
     )
     loader_workers = args.loader_workers
+    skip_samples = checkpoint["processed_samples"] if checkpoint else 0
+    dataset_for_loader: IterableDataset = (
+        _SkipIterableDataset(filtered_dataset, skip_samples)
+        if skip_samples > 0
+        else filtered_dataset
+    )
+    if skip_samples > 0:
+        logging.info(f"Will skip first {skip_samples} samples from the dataset")
     dataloader = DataLoader(
-        dataset=filtered_dataset,
+        dataset=dataset_for_loader,
         batch_size=None,
         num_workers=loader_workers,
         persistent_workers=loader_workers > 0,
@@ -669,36 +759,6 @@ def main() -> None:
         for _ in range(num_processes):
             rank_queue.put(-1)
 
-    # ── Prepare output paths ──
-    tar_output_pattern = str(Path(args.tar_output_pattern).expanduser())
-    jsonl_output_pattern = str(Path(args.jsonl_output_pattern).expanduser())
-    Path(tar_output_pattern).parent.mkdir(parents=True, exist_ok=True)
-    Path(jsonl_output_pattern).parent.mkdir(parents=True, exist_ok=True)
-
-    # Determine output directory from tar_output_pattern
-    output_dir = Path(tar_output_pattern).parent.parent
-    error_log_path = str(output_dir / "errors.jsonl")
-    manifest_path = str(output_dir / "data.lst")
-
-    # Setup error logger (writes to errors.jsonl)
-    error_logger = logging.getLogger("error_log")
-    error_logger.setLevel(logging.ERROR)
-    error_logger.handlers.clear()
-    error_fh = logging.FileHandler(error_log_path, mode="w", encoding="utf-8")
-    error_fh.setFormatter(logging.Formatter("%(message)s"))
-    error_logger.addHandler(error_fh)
-
-    # ── Progress and error tracking ──
-    processed_count = 0
-    error_count = 0
-    write_error_count = 0
-    failed_ids = []
-    shard_idx = 0
-    shard_sample_count = 0
-    shard_duration = 0.0
-    shard_count = 0  # number of shards written to manifest
-    manifest_file = open(manifest_path, "w", encoding="utf-8")
-
     tar_writer = None
     jsonl_file = None
 
@@ -711,14 +771,16 @@ def main() -> None:
         shard_count += 1
 
     def open_new_shard():
-        nonlocal tar_writer, jsonl_file, shard_idx, shard_sample_count, shard_duration
+        nonlocal tar_writer, jsonl_file, shard_idx, shard_sample_count, shard_duration, any_shard_opened
+        had_previous = tar_writer is not None
         if tar_writer is not None:
             tar_writer.close()
         if jsonl_file is not None:
             jsonl_file.close()
-        # Record manifest for the previous shard
-        if shard_idx > 0 and shard_sample_count > 0:
+        # Record manifest for the previous shard (only if opened in this run)
+        if had_previous and shard_sample_count > 0:
             prev_idx = shard_idx - 1
+            save_checkpoint(output_dir, completed_shards=shard_idx, processed_samples=processed_count, error_count=error_count)
             append_shard_to_manifest(prev_idx, shard_sample_count, shard_duration)
         tar_fname = tar_output_pattern % shard_idx
         jsonl_fname = jsonl_output_pattern % shard_idx
@@ -727,6 +789,7 @@ def main() -> None:
         shard_idx += 1
         shard_sample_count = 0
         shard_duration = 0.0
+        any_shard_opened = True
 
     def write_sample(key, audio_tokens_np, metadata):
         nonlocal shard_sample_count, write_error_count, shard_duration
@@ -772,7 +835,8 @@ def main() -> None:
                 f"Skipping failed sample {result['key']}: {result['error_msg']}"
             )
 
-    main_progress = tqdm(total=total_samples, desc="Extracting Audio Tokens")
+    remaining_samples = (total_samples - skip_samples) if total_samples is not None else None
+    main_progress = tqdm(total=remaining_samples, desc="Extracting Audio Tokens")
 
     try:
         with ProcessPoolExecutor(
@@ -832,8 +896,9 @@ def main() -> None:
         if jsonl_file is not None:
             jsonl_file.close()
         # Record the last shard in the manifest
-        if shard_idx > 0 and shard_sample_count > 0:
+        if any_shard_opened and shard_sample_count > 0:
             last_idx = shard_idx - 1
+            save_checkpoint(output_dir, completed_shards=shard_idx, processed_samples=processed_count, error_count=error_count)
             append_shard_to_manifest(last_idx, shard_sample_count, shard_duration)
         manifest_file.close()
 
