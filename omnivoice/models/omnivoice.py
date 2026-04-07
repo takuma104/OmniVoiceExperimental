@@ -160,9 +160,9 @@ class OmniVoiceConfig(PretrainedConfig):
 
     def __init__(
         self,
-        audio_vocab_size: int = 1025,
-        audio_mask_id: int = 1024,
-        num_audio_codebook: int = 8,
+        audio_vocab_size: int = 2049,
+        audio_mask_id: int = 2048,
+        num_audio_codebook: int = 16,
         audio_codebook_weights: Optional[list[float]] = None,
         llm_config: Optional[Union[dict, PretrainedConfig]] = None,
         **kwargs,
@@ -178,7 +178,7 @@ class OmniVoiceConfig(PretrainedConfig):
         self.audio_mask_id = audio_mask_id
         self.num_audio_codebook = num_audio_codebook
         if audio_codebook_weights is None:
-            audio_codebook_weights = [8, 8, 6, 6, 4, 4, 2, 2]
+            audio_codebook_weights = [16, 14, 12, 10, 8, 8, 6, 6, 4, 4, 4, 4, 2, 2, 2, 2]
         self.audio_codebook_weights = audio_codebook_weights
 
 
@@ -1004,7 +1004,7 @@ class OmniVoice(PreTrainedModel):
         if num_ref_audio_tokens is None or ref_text is None or len(ref_text) == 0:
             # Fall back to a simple heuristic (~1s of speech at 12.5 Hz)
             ref_text = "Nice to meet you."
-            num_ref_audio_tokens = 4
+            num_ref_audio_tokens = 13
 
         est = self.duration_estimator.estimate_duration(
             text, ref_text, num_ref_audio_tokens
