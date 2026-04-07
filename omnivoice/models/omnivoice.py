@@ -256,7 +256,8 @@ class OmniVoice(PreTrainedModel):
                     resolved_path = snapshot_download(pretrained_model_name_or_path)
 
                 model.text_tokenizer = AutoTokenizer.from_pretrained(
-                    pretrained_model_name_or_path
+                    pretrained_model_name_or_path,
+                    fix_mistral_regex=True,
                 )
 
                 audio_tokenizer_path = os.path.join(resolved_path, "audio_tokenizer")
