@@ -265,11 +265,8 @@ class OmniVoice(PreTrainedModel):
                 if not os.path.isdir(audio_tokenizer_path):
                     audio_tokenizer_path = "Qwen/Qwen3-TTS-Tokenizer-12Hz"
 
-                tokenizer_device = (
-                    "cpu" if str(model.device).startswith("mps") else model.device
-                )
                 model.audio_tokenizer = Qwen3TTSTokenizer.from_pretrained(
-                    audio_tokenizer_path, device_map=tokenizer_device
+                    audio_tokenizer_path, device_map=model.device
                 )
 
                 model.sampling_rate = model.audio_tokenizer.config.input_sample_rate
