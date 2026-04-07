@@ -41,7 +41,7 @@ class TrainingConfig:
 
     # Model Training Specific
     audio_codebook_weights: List[float | int] = field(
-        default_factory=lambda: [16, 14, 12, 10, 8, 8, 6, 6, 4, 4, 4, 4, 2, 2, 2, 2]
+        default_factory=lambda: [24, 20, 16, 12, 8, 8, 6, 6, 4, 4, 4, 4, 2, 2, 2, 2]
     )
     drop_cond_ratio: float = 0.1
     prompt_ratio_range: Tuple[float, float] = field(default_factory=lambda: (0.0, 0.3))

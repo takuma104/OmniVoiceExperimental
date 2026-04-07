@@ -178,7 +178,7 @@ class OmniVoiceConfig(PretrainedConfig):
         self.audio_mask_id = audio_mask_id
         self.num_audio_codebook = num_audio_codebook
         if audio_codebook_weights is None:
-            audio_codebook_weights = [16, 14, 12, 10, 8, 8, 6, 6, 4, 4, 4, 4, 2, 2, 2, 2]
+            audio_codebook_weights = [24, 20, 16, 12, 8, 8, 6, 6, 4, 4, 4, 4, 2, 2, 2, 2]
         self.audio_codebook_weights = audio_codebook_weights
 
 
