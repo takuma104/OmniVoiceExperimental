@@ -1,6 +1,6 @@
-# Fork: Qwen3 TTS Tokenizer (12Hz) Integration
+# Fork: Qwen3 TTS Tokenizer (12Hz) Integration for OmniVoice
 
-This branch (`qwen3_tts_tokenizer_model`) replaces the audio tokenizer used in OmniVoice from **Higgs Audio V2** (25Hz, 8 codebooks, vocab 1024) to **Qwen3 TTS Tokenizer 12Hz** (12.5Hz, 16 codebooks, vocab 2048).
+This branch (`qwen3_tts_tokenizer_model`) replaces the audio tokenizer used in [OmniVoice](https://github.com/k2-fsa/OmniVoice) from **[Higgs Audio V2](https://github.com/huggingface/transformers/blob/main/docs/source/en/model_doc/higgs_audio_v2_tokenizer.md)** (25Hz, 8 codebooks, vocab 1024, BOSON HIGGS AUDIO 2 COMMUNITY LICENSE) to **[Qwen3 TTS Tokenizer 12Hz](https://github.com/qwenLM/Qwen3-TTS)** (12.5Hz, 16 codebooks, vocab 2048, Apache-2.0 License).
 
 ## Key Changes
 
