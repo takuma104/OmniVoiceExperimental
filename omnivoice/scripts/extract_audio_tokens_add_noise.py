@@ -409,11 +409,8 @@ def process_single_sample(sample: dict[str, Any]) -> dict[str, Any]:
         with torch.inference_mode():
             key = sample["label"]["id"]
 
-            # Qwen3TTSTokenizerV2: encode expects (B, seq_len) with padding_mask
-            wav_input = audio_tensor.to(worker_tokenizer.device)  # (1, T)
-            padding_mask = torch.ones_like(wav_input, dtype=torch.long)
             enc_out = worker_tokenizer.encode(
-                wav_input, padding_mask=padding_mask
+                [audio_tensor.squeeze().numpy()], sr=AUDIO_SAMPLE_RATE
             )
             # audio_codes is a list of (T_i, C) tensors; transpose to (C, T)
             audio_tokens = enc_out.audio_codes[0].T
@@ -427,7 +424,7 @@ def process_single_sample(sample: dict[str, Any]) -> dict[str, Any]:
 
             if enable_aug:
                 clean_token_idx = math.ceil(
-                    clean_sample_idx / worker_tokenizer.encode_downsample_rate
+                    clean_sample_idx / worker_tokenizer.get_encode_downsample_rate()
                 )
                 metadata["clean_start_token_idx"] = clean_token_idx
 
