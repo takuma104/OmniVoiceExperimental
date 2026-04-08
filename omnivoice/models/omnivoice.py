@@ -90,11 +90,11 @@ class VoiceClonePrompt:
 
 @dataclass
 class OmniVoiceGenerationConfig:
-    num_step: int = 32
-    guidance_scale: float = 2.0
+    num_step: int = 48 # tweaked from 32
+    guidance_scale: float = 0.5 # tweaked from 2.0
     t_shift: float = 0.1
-    layer_penalty_factor: float = 5.0
-    position_temperature: float = 5.0
+    layer_penalty_factor: float = 2.3 # original=5.0 5.0 * (8-1)/(16-1) ≈ 2.3
+    position_temperature: float = 4.0 # tweaked from 5.0
     class_temperature: float = 0.0
     denoise: bool = True
     preprocess_prompt: bool = True
