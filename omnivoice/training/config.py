@@ -76,6 +76,7 @@ class TrainingConfig:
     allow_tf32: bool = True
     use_deepspeed: bool = False
     deepspeed_config: Optional[str] = None
+    use_8bit_optimizer: bool = False
 
     # Logging
     logging_steps: int = 100
