@@ -190,11 +190,26 @@ class OmniTrainer:
 
     def create_optimizer_and_scheduler(self):
         """Default AdamW + configurable LR Scheduler."""
-        optimizer = torch.optim.AdamW(
-            self.model.parameters(),
-            lr=self.config.learning_rate,
-            weight_decay=self.config.weight_decay,
-        )
+        if getattr(self.config, "use_8bit_optimizer", False):
+            try:
+                import bitsandbytes as bnb
+            except ImportError:
+                raise ImportError(
+                    "use_8bit_optimizer requires bitsandbytes. "
+                    "Install it with: pip install bitsandbytes"
+                )
+            optimizer = bnb.optim.AdamW8bit(
+                self.model.parameters(),
+                lr=self.config.learning_rate,
+                weight_decay=self.config.weight_decay,
+            )
+            logger.info("Using 8-bit AdamW optimizer (bitsandbytes).")
+        else:
+            optimizer = torch.optim.AdamW(
+                self.model.parameters(),
+                lr=self.config.learning_rate,
+                weight_decay=self.config.weight_decay,
+            )
 
         if self.config.warmup_type == "ratio":
             final_warmup_steps = math.ceil(self.config.steps * self.config.warmup_ratio)
