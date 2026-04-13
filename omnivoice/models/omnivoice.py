@@ -1220,9 +1220,12 @@ class OmniVoice(PreTrainedModel):
                 rem -= int(num)
             schedules.append(sched)
 
-        layer_ids = torch.arange(
-            self.config.num_audio_codebook, device=self.device
-        ).view(1, -1, 1)
+        # Codebook layer penalty:
+        # A layer ID matrix for adding penalties to logits so that smaller values are unmasked first. 
+        # Set the layer penalty in the importance order of `audio_codebook_weights`.
+        layer_penalty = torch.tensor([6, 0, 1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15], 
+                                 device=self.device).view(1, -1, 1)
+        assert layer_penalty.shape[1] == self.config.num_audio_codebook
 
         for step in range(gen_config.num_step):
             batch_logits = self(
@@ -1250,7 +1253,7 @@ class OmniVoice(PreTrainedModel):
                     gen_config
                 )
 
-                scores = scores - (layer_ids * gen_config.layer_penalty_factor)
+                scores = scores - (layer_penalty * gen_config.layer_penalty_factor)
 
                 if gen_config.position_temperature != 0:
                     scores = _gumbel_sample(scores, gen_config.position_temperature)
