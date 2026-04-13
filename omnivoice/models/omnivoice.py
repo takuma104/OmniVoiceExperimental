@@ -510,6 +510,8 @@ class OmniVoice(PreTrainedModel):
 
         # Duration prediction loss
         if num_audio_tokens is not None and document_ids is not None:
+            # Remove batch dim: [1, num_docs] -> [num_docs]
+            num_audio_tokens = num_audio_tokens.squeeze(0)
             boundary_hidden, doc_valid = self._extract_text_boundary_hidden(
                 hidden_states, audio_mask, document_ids
             )

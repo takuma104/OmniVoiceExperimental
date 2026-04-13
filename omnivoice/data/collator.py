@@ -93,6 +93,6 @@ class PackingDataCollator:
             [s["num_audio_tokens"] for s in processed_samples],
             dtype=torch.long,
         )
-        return_list["num_audio_tokens"] = num_audio_tokens  # [num_docs]
+        return_list["num_audio_tokens"] = num_audio_tokens.unsqueeze(0)  # [1, num_docs]
 
         return return_list
