@@ -43,6 +43,9 @@ class TrainingConfig:
     audio_codebook_weights: List[float | int] = field(
         default_factory=lambda: [24, 20, 16, 12, 8, 8, 6, 6, 4, 4, 4, 4, 2, 2, 2, 2]
     )
+    num_duration_bins: int = 128
+    max_duration_tokens: int = 500
+    duration_loss_weight: float = 0.1
     drop_cond_ratio: float = 0.1
     prompt_ratio_range: Tuple[float, float] = field(default_factory=lambda: (0.0, 0.3))
     mask_ratio_range: Tuple[float, float] = field(default_factory=lambda: (0.0, 1.0))

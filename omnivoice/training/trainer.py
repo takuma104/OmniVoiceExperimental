@@ -309,7 +309,9 @@ class OmniTrainer:
         logging_start_time = time.time()
         logging_start_step = self.global_step
         tr_loss = torch.tensor(0.0).to(self.accelerator.device)
+        tr_duration_loss = torch.tensor(0.0).to(self.accelerator.device)
         logging_loss_scalar = 0.0
+        logging_duration_loss_scalar = 0.0
         logging_text_tokens = 0
         logging_audio_tokens = 0
 
@@ -336,6 +338,8 @@ class OmniTrainer:
                 outputs = self.model(**batch)
                 loss = outputs.loss
                 tr_loss += loss.detach()
+                if outputs.duration_loss is not None:
+                    tr_duration_loss += outputs.duration_loss.detach()
                 self.accelerator.backward(loss)
 
                 if self.accelerator.sync_gradients:
@@ -376,8 +380,17 @@ class OmniTrainer:
                         )
                         logging_loss_scalar = tr_loss_scalar
 
+                        tr_dur_scalar = self.accelerator.gather(tr_duration_loss).mean().item()
+                        current_dur_loss = tr_dur_scalar - logging_duration_loss_scalar
+                        avg_duration_loss = current_dur_loss / (
+                            self.config.logging_steps
+                            * self.config.gradient_accumulation_steps
+                        )
+                        logging_duration_loss_scalar = tr_dur_scalar
+
                         logs = {
                             "train/loss": avg_loss,
+                            "train/duration_loss": avg_duration_loss,
                             "train/learning_rate": current_lr,
                             "train/grad_norm": grad_norm,
                             "train/epoch": self.epoch,

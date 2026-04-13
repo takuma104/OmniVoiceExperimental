@@ -167,6 +167,7 @@ class OmniVoiceSampleProcessor:
             "labels": labels,  # [C, L]
             "audio_mask": audio_mask,  # [L]
             "length": total_length,
+            "num_audio_tokens": audio_tokens.shape[1],
         }
 
         return return_dict
@@ -253,6 +254,7 @@ class OmniVoiceSimpleSampleProcessor:
             "labels": labels,  # [C, L]
             "audio_mask": audio_mask,  # [L]
             "length": total_length,
+            "num_audio_tokens": audio_tokens.shape[1],
         }
 
         return return_dict

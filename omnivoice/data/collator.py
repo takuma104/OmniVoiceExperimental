@@ -89,4 +89,10 @@ class PackingDataCollator:
         )
         return_list["document_ids"] = document_ids.unsqueeze(0)  # [1, L]
 
+        num_audio_tokens = torch.tensor(
+            [s["num_audio_tokens"] for s in processed_samples],
+            dtype=torch.long,
+        )
+        return_list["num_audio_tokens"] = num_audio_tokens  # [num_docs]
+
         return return_list

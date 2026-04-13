@@ -147,6 +147,7 @@ class GenerationTask:
 class OmniVoiceModelOutput(ModelOutput):
     loss: Optional[torch.Tensor] = None
     logits: Optional[torch.Tensor] = None
+    duration_loss: Optional[torch.Tensor] = None
 
 
 # ---------------------------------------------------------------------------
@@ -164,6 +165,9 @@ class OmniVoiceConfig(PretrainedConfig):
         audio_mask_id: int = 2048,
         num_audio_codebook: int = 16,
         audio_codebook_weights: Optional[list[float]] = None,
+        num_duration_bins: int = 128,
+        max_duration_tokens: int = 500,
+        duration_loss_weight: float = 0.1,
         llm_config: Optional[Union[dict, PretrainedConfig]] = None,
         **kwargs,
     ):
@@ -180,6 +184,9 @@ class OmniVoiceConfig(PretrainedConfig):
         if audio_codebook_weights is None:
             audio_codebook_weights = [24, 20, 16, 12, 8, 8, 6, 6, 4, 4, 4, 4, 2, 2, 2, 2]
         self.audio_codebook_weights = audio_codebook_weights
+        self.num_duration_bins = num_duration_bins
+        self.max_duration_tokens = max_duration_tokens
+        self.duration_loss_weight = duration_loss_weight
 
 
 class OmniVoice(PreTrainedModel):
@@ -212,6 +219,17 @@ class OmniVoice(PreTrainedModel):
             config.num_audio_codebook * config.audio_vocab_size,
             bias=False,
         )
+
+        self.duration_head = nn.Linear(
+            self.config.llm_config.hidden_size,
+            config.num_duration_bins,
+        )
+        duration_bins = torch.logspace(
+            0,
+            math.log10(config.max_duration_tokens),
+            config.num_duration_bins,
+        )
+        self.register_buffer("duration_bins", duration_bins)
 
         self.normalized_audio_codebook_weights = [
             w / sum(config.audio_codebook_weights)
@@ -364,6 +382,59 @@ class OmniVoice(PreTrainedModel):
 
         return torch.where(audio_mask.unsqueeze(-1), audio_embeds, text_embeds)
 
+    def _extract_text_boundary_hidden(
+        self,
+        hidden_states: torch.Tensor,
+        audio_mask: torch.Tensor,
+        document_ids: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Extract hidden states at the text-to-audio boundary for each document.
+
+        For each document in the packed batch, finds the last text position
+        (audio_mask==False) just before the audio region begins.
+
+        Args:
+            hidden_states: [B, S, H] — LLM output hidden states.
+            audio_mask: [B, S] — True for audio positions, False for text.
+            document_ids: [B, S] — Document index per position (-1 for padding).
+
+        Returns:
+            boundary_hidden: [num_valid_docs, H] — hidden states at boundaries.
+            valid_mask: [num_docs] — boolean mask indicating which documents
+                have a valid text boundary (False for drop_cond documents
+                where audio_mask is all True).
+        """
+        # Operate on the first (only) batch element for packed sequences
+        doc_ids = document_ids[0]  # [S]
+        a_mask = audio_mask[0]  # [S]
+        hs = hidden_states[0]  # [S, H]
+
+        unique_docs = doc_ids[doc_ids >= 0].unique()
+        num_docs = unique_docs.numel()
+        hidden_size = hs.shape[-1]
+
+        boundary_hidden_list = []
+        valid_list = []
+
+        for d in unique_docs:
+            doc_positions = (doc_ids == d)
+            text_positions = doc_positions & ~a_mask
+
+            if text_positions.any():
+                # Last text position = boundary
+                last_text_idx = text_positions.nonzero(as_tuple=False)[-1].item()
+                boundary_hidden_list.append(hs[last_text_idx])
+                valid_list.append(True)
+            else:
+                # drop_cond: all audio, no text boundary
+                boundary_hidden_list.append(torch.zeros(hidden_size, device=hs.device))
+                valid_list.append(False)
+
+        boundary_hidden = torch.stack(boundary_hidden_list)  # [num_docs, H]
+        valid_mask = torch.tensor(valid_list, dtype=torch.bool, device=hs.device)
+
+        return boundary_hidden, valid_mask
+
     def forward(
         self,
         input_ids: torch.LongTensor,
@@ -372,6 +443,7 @@ class OmniVoice(PreTrainedModel):
         attention_mask: Optional[torch.Tensor] = None,
         document_ids: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
+        num_audio_tokens: Optional[torch.LongTensor] = None,
     ):
 
         inputs_embeds = self._prepare_embed_inputs(input_ids, audio_mask)
@@ -398,6 +470,7 @@ class OmniVoice(PreTrainedModel):
         hidden_states = llm_outputs[0]
 
         loss = None
+        duration_loss = None
 
         # Shape: [B, S, C * Vocab]
         batch_size, seq_len, _ = hidden_states.shape
@@ -432,11 +505,32 @@ class OmniVoice(PreTrainedModel):
             weights = torch.tensor(
                 self.normalized_audio_codebook_weights, device=audio_logits.device
             )
-            loss = (layer_means * weights).sum()
+            audio_loss = (layer_means * weights).sum()
+            loss = audio_loss
+
+        # Duration prediction loss
+        if num_audio_tokens is not None and document_ids is not None:
+            boundary_hidden, doc_valid = self._extract_text_boundary_hidden(
+                hidden_states, audio_mask, document_ids
+            )
+            if doc_valid.any():
+                dur_logits = self.duration_head(
+                    boundary_hidden[doc_valid]
+                )  # [num_valid, num_bins]
+                dur_targets = torch.bucketize(
+                    num_audio_tokens[doc_valid].float().to(hidden_states.device),
+                    self.duration_bins,
+                ).clamp(0, self.config.num_duration_bins - 1)
+                duration_loss = torch.nn.functional.cross_entropy(
+                    dur_logits, dur_targets
+                )
+                if loss is not None:
+                    loss = loss + self.config.duration_loss_weight * duration_loss
 
         return OmniVoiceModelOutput(
             loss=loss,
             logits=audio_logits,
+            duration_loss=duration_loss,
         )
 
     def supported_language_ids(self) -> set[str]:
@@ -801,10 +895,11 @@ class OmniVoice(PreTrainedModel):
         def _run_batch(indices, texts, ref_audios, ref_texts):
             speed_list = task.speed
             target_lens = [
-                self._estimate_target_tokens(
+                self._predict_duration(
                     texts[j],
-                    ref_texts[j],
-                    ref_audios[j].size(-1) if ref_audios[j] is not None else None,
+                    ref_text=ref_texts[j],
+                    lang=task.langs[i],
+                    instruct=task.instructs[i],
                     speed=speed_list[i] if speed_list else 1.0,
                 )
                 for j, i in enumerate(indices)
@@ -962,12 +1057,11 @@ class OmniVoice(PreTrainedModel):
             # to get the raw estimate, then override target_lens below.
             has_dur = durations is not None and durations[i] is not None
             item_speed = 1.0 if has_dur else (user_speed[i] if user_speed else 1.0)
-            est = self._estimate_target_tokens(
+            est = self._predict_duration(
                 text_list[i],
-                ref_text_list[i],
-                ref_audio_tokens_list[i].size(-1)
-                if ref_audio_tokens_list[i] is not None
-                else None,
+                ref_text=ref_text_list[i],
+                lang=language_list[i],
+                instruct=instruct_list[i],
                 speed=item_speed,
             )
             num_target_tokens_list.append(est)
@@ -1003,7 +1097,7 @@ class OmniVoice(PreTrainedModel):
         )
 
     def _estimate_target_tokens(self, text, ref_text, num_ref_audio_tokens, speed=1.0):
-        """Estimate number of target audio tokens."""
+        """Estimate number of target audio tokens using rule-based heuristic."""
         if num_ref_audio_tokens is None or ref_text is None or len(ref_text) == 0:
             # Fall back to a simple heuristic (~1s of speech at 12.5 Hz)
             ref_text = "Nice to meet you."
@@ -1015,6 +1109,70 @@ class OmniVoice(PreTrainedModel):
         if speed > 0 and speed != 1.0:
             est = est / speed
         return max(1, int(est))
+
+    @torch.no_grad()
+    def _predict_duration(
+        self,
+        text: str,
+        ref_text: Optional[str] = None,
+        lang: Optional[str] = None,
+        instruct: Optional[str] = None,
+        speed: float = 1.0,
+    ) -> int:
+        """Predict audio token count using the learned duration head.
+
+        Builds a style+text token sequence, runs one LLM forward pass,
+        and uses ``duration_head`` on the last hidden state to classify
+        the expected audio length into a duration bin.
+
+        Falls back to rule-based estimation when the duration head has
+        not been trained (all-zero weights).
+        """
+        # Build style tokens
+        lang_str = lang if lang else "None"
+        instruct_str = instruct if instruct else "None"
+        style_text = f"<|lang_start|>{lang_str}<|lang_end|>"
+        style_text += f"<|instruct_start|>{instruct_str}<|instruct_end|>"
+
+        style_tokens = self.text_tokenizer(
+            style_text, return_tensors="pt"
+        ).input_ids.to(self.device)  # [1, N1]
+
+        # Build text tokens
+        full_text = _combine_text(ref_text=ref_text, text=text)
+        wrapped_text = f"<|text_start|>{full_text}<|text_end|>"
+        text_tokens = _tokenize_with_nonverbal_tags(
+            wrapped_text, self.text_tokenizer
+        ).to(self.device)  # [1, N2]
+
+        input_ids = torch.cat([style_tokens, text_tokens], dim=1)  # [1, N]
+        seq_len = input_ids.size(1)
+
+        # Expand to [1, C, N] with layer 0 = text tokens
+        input_ids_expanded = input_ids.unsqueeze(0).repeat(
+            1, self.config.num_audio_codebook, 1
+        )  # [1, C, N]
+        audio_mask = torch.zeros(
+            1, seq_len, dtype=torch.bool, device=self.device
+        )
+
+        inputs_embeds = self._prepare_embed_inputs(input_ids_expanded, audio_mask)
+
+        llm_outputs = self.llm(
+            inputs_embeds=inputs_embeds,
+            return_dict=True,
+        )
+        hidden_states = llm_outputs[0]  # [1, N, H]
+
+        # Use the last position's hidden state for duration prediction
+        last_hidden = hidden_states[0, -1, :]  # [H]
+        dur_logits = self.duration_head(last_hidden)  # [num_bins]
+        bin_idx = dur_logits.argmax().item()
+
+        predicted = max(1, int(self.duration_bins[bin_idx].item()))
+        if speed > 0 and speed != 1.0:
+            predicted = max(1, int(predicted / speed))
+        return predicted
 
     def _ensure_list(
         self, x: Union[Any, List[Any]], batch_size: int, auto_repeat: bool = True
