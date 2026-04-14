@@ -168,6 +168,7 @@ class OmniVoiceConfig(PretrainedConfig):
         num_duration_bins: int = 128,
         max_duration_tokens: int = 500,
         duration_loss_weight: float = 0.1,
+        audio_len_token_id: Optional[int] = None,
         llm_config: Optional[Union[dict, PretrainedConfig]] = None,
         **kwargs,
     ):
@@ -187,6 +188,7 @@ class OmniVoiceConfig(PretrainedConfig):
         self.num_duration_bins = num_duration_bins
         self.max_duration_tokens = max_duration_tokens
         self.duration_loss_weight = duration_loss_weight
+        self.audio_len_token_id = audio_len_token_id
 
 
 class OmniVoice(PreTrainedModel):
@@ -1130,10 +1132,11 @@ class OmniVoice(PreTrainedModel):
     ) -> int:
         """Predict audio token count using the learned duration head.
 
-        Builds a style+text token sequence that matches the training-time
-        format produced by ``OmniVoiceSampleProcessor``, runs one LLM
-        forward pass, and uses ``duration_head`` on the last hidden state
-        to classify the expected audio length into a duration bin.
+        Builds a ``[style | text | <|audio_token_len|>]`` token sequence that
+        matches the training-time prefix produced by
+        ``OmniVoiceSampleProcessor``, runs one LLM forward pass, and
+        uses ``duration_head`` on the ``<|audio_token_len|>`` position's hidden
+        state to classify the expected audio length into a duration bin.
         """
         # Build style tokens — must match processor format exactly
         lang_str = lang if lang else "None"
@@ -1153,7 +1156,14 @@ class OmniVoice(PreTrainedModel):
             wrapped_text, return_tensors="pt"
         ).input_ids.to(self.device)  # [1, N2]
 
-        input_ids = torch.cat([style_tokens, text_tokens], dim=1)  # [1, N]
+        # Duration marker — matches training sequence format
+        audio_len_token = self.text_tokenizer(
+            "<|audio_token_len|>", return_tensors="pt"
+        ).input_ids.to(self.device)  # [1, 1]
+
+        input_ids = torch.cat(
+            [style_tokens, text_tokens, audio_len_token], dim=1
+        )  # [1, N]
         seq_len = input_ids.size(1)
 
         # Expand to [1, C, N] with layer 0 = text tokens
@@ -1172,7 +1182,7 @@ class OmniVoice(PreTrainedModel):
         )
         hidden_states = llm_outputs[0]  # [1, N, H]
 
-        # Use the last position's hidden state for duration prediction
+        # Last position is <|audio_token_len|> — same prefix as training
         last_hidden = hidden_states[0, -1, :]  # [H]
         dur_logits = self.duration_head(last_hidden)  # [num_bins]
         bin_idx = dur_logits.argmax().item()
@@ -1248,6 +1258,13 @@ class OmniVoice(PreTrainedModel):
             self.device
         )  # [1, C, N2]
 
+        # Duration marker — matches training sequence format
+        audio_len_token = (
+            self.text_tokenizer("<|audio_token_len|>", return_tensors="pt")
+            .input_ids.repeat(self.config.num_audio_codebook, 1)
+            .unsqueeze(0)
+        ).to(self.device)  # [1, C, 1]
+
         # Target: all MASK
         target_audio_tokens = torch.full(
             (1, self.config.num_audio_codebook, num_target_tokens),
@@ -1256,8 +1273,8 @@ class OmniVoice(PreTrainedModel):
             device=self.device,
         )
 
-        # Conditional input
-        parts = [style_tokens, text_tokens]
+        # Conditional input: [style | text | <|audio_token_len|> | ref_audio? | target_audio]
+        parts = [style_tokens, text_tokens, audio_len_token]
         if ref_audio_tokens is not None:
             parts.append(ref_audio_tokens.unsqueeze(0).to(self.device))
         parts.append(target_audio_tokens)

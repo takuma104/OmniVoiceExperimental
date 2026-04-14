@@ -1,7 +1,7 @@
 """Debug script for duration head training diagnostics.
 
 Loads a checkpoint and a training batch, then inspects:
-1. Boundary extraction correctness (positions, valid_mask)
+1. Boundary extraction correctness (positions, valid_mask, <|audio_token_len|> marker)
 2. Duration bin targets (histogram of bucketized values)
 3. Duration head output distribution (logits, predicted vs actual)
 4. Comparison of training-mode vs inference-mode predictions
@@ -9,11 +9,8 @@ Loads a checkpoint and a training batch, then inspects:
 """
 
 import argparse
-import math
-import sys
 
 import torch
-from transformers import AutoTokenizer
 
 from omnivoice.data.collator import PackingDataCollator
 from omnivoice.data.processor import OmniVoiceSampleProcessor
@@ -103,9 +100,21 @@ def inspect_boundary_extraction(model, batch):
     a_mask = audio_mask[0]
     unique_docs = doc_ids[doc_ids >= 0].unique()
 
+    # Check if <|audio_token_len|> token is present
+    audio_len_token_id = model.config.audio_len_token_id
+    layer0_ids = input_ids[0, 0, :]  # text token IDs (layer 0)
+
     print(f"  Sequence length: {doc_ids.shape[0]}")
     print(f"  Num documents:   {unique_docs.numel()}")
     print(f"  Valid docs:      {valid_mask.sum().item()} / {valid_mask.numel()}")
+    if audio_len_token_id is not None:
+        marker_positions = (layer0_ids == audio_len_token_id).nonzero(
+            as_tuple=False
+        ).squeeze(-1)
+        print(f"  <|audio_token_len|> token ID: {audio_len_token_id}")
+        print(f"  <|audio_token_len|> positions: {marker_positions.tolist()}")
+    else:
+        print("  <|audio_token_len|> token ID: NOT SET in config")
     print()
 
     for d in unique_docs:
@@ -117,8 +126,15 @@ def inspect_boundary_extraction(model, batch):
 
         if text_indices.numel() > 0:
             boundary_idx = text_indices[-1].item()
+            boundary_token_id = layer0_ids[boundary_idx].item()
+            is_marker = (
+                boundary_token_id == audio_len_token_id
+                if audio_len_token_id is not None
+                else "N/A"
+            )
         else:
             boundary_idx = None
+            is_marker = False
 
         print(f"  Doc {d.item()}:")
         print(f"    Text positions:  {text_indices.numel()} "
@@ -128,6 +144,7 @@ def inspect_boundary_extraction(model, batch):
               f"(range {audio_indices[0].item()}-{audio_indices[-1].item()})"
               if audio_indices.numel() > 0 else "    Audio positions: 0")
         print(f"    Boundary index:  {boundary_idx}")
+        print(f"    Boundary is <|audio_token_len|>: {is_marker}")
         print(f"    Valid:           {valid_mask[d.item()].item()}")
     print()
 
@@ -233,9 +250,9 @@ def inspect_hidden_state_comparison(model, batch, texts):
     """Compare hidden states from training-path vs inference-path.
 
     For the first document in the packed batch, extracts the text-only
-    tokens and runs a separate text-only forward pass (mimicking the
-    inference _predict_duration path). Then compares the hidden states
-    at corresponding positions.
+    tokens (including <|audio_token_len|>) and runs a separate forward pass
+    mimicking the inference _predict_duration path. Then compares the
+    hidden states at the <|audio_token_len|> position.
     """
     print("=" * 60)
     print("5. Hidden State Comparison (training-path vs inference-path)")
@@ -246,7 +263,7 @@ def inspect_hidden_state_comparison(model, batch, texts):
     audio_mask = batch["audio_mask"].to(device)
     document_ids = batch["document_ids"].to(device)
 
-    # --- Training path: forward with packed batch (no block mask for simplicity) ---
+    # --- Training path: forward with packed batch ---
     inputs_embeds = model._prepare_embed_inputs(input_ids, audio_mask)
     with torch.no_grad():
         train_hidden = model.llm(
@@ -256,7 +273,7 @@ def inspect_hidden_state_comparison(model, batch, texts):
     doc_ids = document_ids[0]
     a_mask = audio_mask[0]
 
-    # We'll check document 0 which starts at position 0 (no cross-doc leakage)
+    # Document 0 starts at position 0 (no cross-doc attention leakage)
     doc0_mask = (doc_ids == 0)
     doc0_text_mask = doc0_mask & ~a_mask
     doc0_text_indices = doc0_text_mask.nonzero(as_tuple=False).squeeze(-1)
@@ -268,9 +285,7 @@ def inspect_hidden_state_comparison(model, batch, texts):
     boundary_idx = doc0_text_indices[-1].item()
     train_boundary_hs = train_hidden[0, boundary_idx, :]
 
-    # --- Inference path: text-only forward (same as _predict_duration) ---
-    # Reconstruct the text-only input for doc 0
-    # Extract the text token IDs from the packed batch (layer 0)
+    # --- Inference path: text-only forward with same tokens ---
     text_token_ids = input_ids[0, 0, doc0_text_indices]  # [num_text_tokens]
     text_token_ids = text_token_ids.unsqueeze(0)  # [1, N]
     seq_len = text_token_ids.size(1)
@@ -289,7 +304,7 @@ def inspect_hidden_state_comparison(model, batch, texts):
             inputs_embeds=text_embeds, return_dict=True
         )[0]
 
-    infer_boundary_hs = infer_hidden[0, -1, :]  # last position
+    infer_boundary_hs = infer_hidden[0, -1, :]  # last position = <|audio_token_len|>
 
     # --- Comparison ---
     cos_sim = torch.nn.functional.cosine_similarity(
@@ -300,14 +315,20 @@ def inspect_hidden_state_comparison(model, batch, texts):
     train_norm = train_boundary_hs.norm().item()
     infer_norm = infer_boundary_hs.norm().item()
 
-    print(f"  Doc 0 boundary (pos {boundary_idx}):")
+    # Check what token is at the boundary
+    audio_len_token_id = model.config.audio_len_token_id
+    boundary_token = input_ids[0, 0, boundary_idx].item()
+    is_marker = boundary_token == audio_len_token_id if audio_len_token_id else "N/A"
+
+    print(f"  Doc 0 boundary (pos {boundary_idx}, "
+          f"is <|audio_token_len|>: {is_marker}):")
     print(f"    Training-path hidden norm:  {train_norm:.4f}")
     print(f"    Inference-path hidden norm: {infer_norm:.4f}")
     print(f"    Cosine similarity:          {cos_sim:.6f}")
     print(f"    L2 distance:                {l2_dist:.4f}")
     print()
 
-    # Also compare duration head outputs for both
+    # Compare duration head outputs for both
     with torch.no_grad():
         train_logits = model.duration_head(train_boundary_hs)
         infer_logits = model.duration_head(infer_boundary_hs)
