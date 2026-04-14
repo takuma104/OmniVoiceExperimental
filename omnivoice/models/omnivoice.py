@@ -220,9 +220,11 @@ class OmniVoice(PreTrainedModel):
             bias=False,
         )
 
-        self.duration_head = nn.Linear(
-            self.config.llm_config.hidden_size,
-            config.num_duration_bins,
+        hidden_size = self.config.llm_config.hidden_size
+        self.duration_head = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size),
+            nn.SiLU(),
+            nn.Linear(hidden_size, config.num_duration_bins),
         )
         duration_bins = torch.logspace(
             0,
@@ -509,11 +511,16 @@ class OmniVoice(PreTrainedModel):
             loss = audio_loss
 
         # Duration prediction loss
+        # Detach hidden_states so the duration head learns from features
+        # naturally produced by the backbone (shaped by audio loss), without
+        # the duration gradient altering backbone representations.  This
+        # prevents a train/inference gap where the backbone only produces
+        # duration-useful features when the duration loss is in the graph.
         if num_audio_tokens is not None and document_ids is not None:
             # Remove batch dim: [1, num_docs] -> [num_docs]
             num_audio_tokens = num_audio_tokens.squeeze(0)
             boundary_hidden, doc_valid = self._extract_text_boundary_hidden(
-                hidden_states, audio_mask, document_ids
+                hidden_states.detach(), audio_mask, document_ids
             )
             if doc_valid.any():
                 dur_logits = self.duration_head(
@@ -1123,14 +1130,12 @@ class OmniVoice(PreTrainedModel):
     ) -> int:
         """Predict audio token count using the learned duration head.
 
-        Builds a style+text token sequence, runs one LLM forward pass,
-        and uses ``duration_head`` on the last hidden state to classify
-        the expected audio length into a duration bin.
-
-        Falls back to rule-based estimation when the duration head has
-        not been trained (all-zero weights).
+        Builds a style+text token sequence that matches the training-time
+        format produced by ``OmniVoiceSampleProcessor``, runs one LLM
+        forward pass, and uses ``duration_head`` on the last hidden state
+        to classify the expected audio length into a duration bin.
         """
-        # Build style tokens
+        # Build style tokens — must match processor format exactly
         lang_str = lang if lang else "None"
         instruct_str = instruct if instruct else "None"
         style_text = f"<|lang_start|>{lang_str}<|lang_end|>"
@@ -1140,12 +1145,13 @@ class OmniVoice(PreTrainedModel):
             style_text, return_tensors="pt"
         ).input_ids.to(self.device)  # [1, N1]
 
-        # Build text tokens
-        full_text = _combine_text(ref_text=ref_text, text=text)
-        wrapped_text = f"<|text_start|>{full_text}<|text_end|>"
-        text_tokens = _tokenize_with_nonverbal_tags(
-            wrapped_text, self.text_tokenizer
-        ).to(self.device)  # [1, N2]
+        # Build text tokens — use only the target text (no ref_text),
+        # matching the training processor which uses sample["label"]["text"]
+        # without combining reference text.
+        wrapped_text = f"<|text_start|>{text}<|text_end|>"
+        text_tokens = self.text_tokenizer(
+            wrapped_text, return_tensors="pt"
+        ).input_ids.to(self.device)  # [1, N2]
 
         input_ids = torch.cat([style_tokens, text_tokens], dim=1)  # [1, N]
         seq_len = input_ids.size(1)
