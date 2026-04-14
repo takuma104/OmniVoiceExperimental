@@ -110,6 +110,19 @@ def get_parser() -> argparse.ArgumentParser:
     parser.add_argument("--position_temperature", type=float, default=5.0)
     parser.add_argument("--class_temperature", type=float, default=0.0)
     parser.add_argument(
+        "--iterative_strategy",
+        type=str,
+        default="schedule",
+        choices=["schedule", "confidence"],
+        help="Generation strategy: 'schedule' (fixed N-step) or 'confidence' (re-mask low-confidence).",
+    )
+    parser.add_argument("--confidence_threshold", type=float, default=-1.0,
+                        help="Log-prob threshold for confidence-based strategy.")
+    parser.add_argument("--confidence_max_iter", type=int, default=16,
+                        help="Max re-mask iterations for confidence-based strategy.")
+    parser.add_argument("--confidence_min_remask_frac", type=float, default=0.02,
+                        help="Stop early if re-masked fraction drops below this.")
+    parser.add_argument(
         "--device",
         type=str,
         default=None,

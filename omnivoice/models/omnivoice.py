@@ -101,6 +101,10 @@ class OmniVoiceGenerationConfig:
     postprocess_output: bool = True
     audio_chunk_duration: float = 15.0
     audio_chunk_threshold: float = 30.0
+    iterative_strategy: str = "schedule"  # "schedule" (existing) or "confidence" (new)
+    confidence_threshold: float = -1.0  # log-prob threshold; positions below this are re-masked
+    confidence_max_iter: int = 16  # maximum re-mask/re-predict iterations
+    confidence_min_remask_frac: float = 0.02  # stop early if re-masked fraction drops below this
 
     @classmethod
     def from_dict(cls, kwargs_dict):
@@ -556,7 +560,7 @@ class OmniVoice(PreTrainedModel):
 
         if short_idx:
             short_task = full_task.slice_task(short_idx)
-            short_results = self._generate_iterative(short_task, gen_config)
+            short_results = self._dispatch_generate(short_task, gen_config)
             for idx, res in zip(short_idx, short_results):
                 results[idx] = res
 
@@ -820,7 +824,7 @@ class OmniVoice(PreTrainedModel):
                 ref_rms=[task.ref_rms[i] for i in indices],
                 speed=[task.speed[i] for i in indices] if task.speed else None,
             )
-            gen_tokens = self._generate_iterative(sub_task, gen_config)
+            gen_tokens = self._dispatch_generate(sub_task, gen_config)
             for j, idx in enumerate(indices):
                 chunk_results[idx].append(gen_tokens[j])
 
@@ -1112,21 +1116,20 @@ class OmniVoice(PreTrainedModel):
             "audio_mask": cond_audio_mask,
         }
 
-    def _generate_iterative(
+    def _prepare_batched_generation_inputs(
         self, task: GenerationTask, gen_config: OmniVoiceGenerationConfig
-    ) -> List[torch.Tensor]:
-        """N-step iterative unmasked decoding.
+    ):
+        """Prepare batched tensors for iterative generation.
 
-        Args:
-            task: A :class:`GenerationTask` containing batch texts, target
-                lengths, languages, instructions, and optional reference data.
-            gen_config: A :class:`OmniVoiceGenerationConfig` controlling
-                decoding steps, guidance, temperatures, etc.
         Returns:
-            List of generated audio token tensors of shape (C, T) (one per
-            input text).
+            Tuple of (batch_input_ids, batch_audio_mask, batch_attention_mask,
+            tokens, c_lens) where:
+            - batch_input_ids: (batch_size, C, max_c_len)
+            - batch_audio_mask: (batch_size, max_c_len)
+            - batch_attention_mask: (batch_size, 1, max_c_len, max_c_len)
+            - tokens: (B, C, max_target_len), initialized to audio_mask_id
+            - c_lens: list of per-item conditional lengths
         """
-
         B = task.batch_size
 
         for i in range(B):
@@ -1155,7 +1158,7 @@ class OmniVoice(PreTrainedModel):
 
         c_lens = [inp["input_ids"].size(2) for inp in inputs_list]
         max_c_len = max(c_lens)
-        pad_id = self.config.audio_mask_id  # Or any other tokens
+        pad_id = self.config.audio_mask_id
 
         batch_size = 2 * B if gen_config.guidance_scale != 0 else B
 
@@ -1195,6 +1198,27 @@ class OmniVoice(PreTrainedModel):
             dtype=torch.long,
             device=self.device,
         )
+
+        return batch_input_ids, batch_audio_mask, batch_attention_mask, tokens, c_lens
+
+    def _generate_iterative(
+        self, task: GenerationTask, gen_config: OmniVoiceGenerationConfig
+    ) -> List[torch.Tensor]:
+        """N-step iterative unmasked decoding.
+
+        Args:
+            task: A :class:`GenerationTask` containing batch texts, target
+                lengths, languages, instructions, and optional reference data.
+            gen_config: A :class:`OmniVoiceGenerationConfig` controlling
+                decoding steps, guidance, temperatures, etc.
+        Returns:
+            List of generated audio token tensors of shape (C, T) (one per
+            input text).
+        """
+
+        B = task.batch_size
+        batch_input_ids, batch_audio_mask, batch_attention_mask, tokens, c_lens = \
+            self._prepare_batched_generation_inputs(task, gen_config)
 
         timesteps = _get_time_steps(
             t_start=0.0,
@@ -1300,6 +1324,175 @@ class OmniVoice(PreTrainedModel):
         confidence_scores = log_probs.max(dim=-1)[0]
 
         return pred_tokens, confidence_scores
+
+    def _generate_iterative_confidence(
+        self, task: GenerationTask, gen_config: OmniVoiceGenerationConfig
+    ) -> List[torch.Tensor]:
+        """Confidence-based iterative unmasking decoding.
+
+        Instead of a fixed schedule, this method:
+        1. Predicts all positions in one shot (from all-masked input).
+        2. Re-masks positions where model confidence is below a threshold.
+        3. Re-predicts those positions using high-confidence tokens as context.
+        4. Repeats until all positions are confident or max iterations reached.
+
+        Args:
+            task: A :class:`GenerationTask` containing batch texts, target
+                lengths, languages, instructions, and optional reference data.
+            gen_config: A :class:`OmniVoiceGenerationConfig` controlling
+                confidence threshold, max iterations, etc.
+        Returns:
+            List of generated audio token tensors of shape (C, T) (one per
+            input text).
+        """
+
+        B = task.batch_size
+        C = self.config.num_audio_codebook
+        batch_input_ids, batch_audio_mask, batch_attention_mask, tokens, c_lens = \
+            self._prepare_batched_generation_inputs(task, gen_config)
+
+        # Storage for per-position confidence scores
+        max_t_len = max(task.target_lens)
+        all_confidence = torch.full(
+            (B, C, max_t_len), -float("inf"), device=self.device
+        )
+
+        # --- Phase 1: Initial full prediction (all positions masked) ---
+        batch_logits = self(
+            input_ids=batch_input_ids,
+            audio_mask=batch_audio_mask,
+            attention_mask=batch_attention_mask,
+        ).logits.to(torch.float32)
+
+        for i in range(B):
+            c_len, t_len = c_lens[i], task.target_lens[i]
+
+            c_logits = batch_logits[i : i + 1, :, c_len - t_len : c_len, :]
+            u_logits = (
+                batch_logits[B + i : B + i + 1, :, :t_len, :]
+                if gen_config.guidance_scale != 0
+                else None
+            )
+
+            pred_tokens, confidence = self._predict_tokens_with_scoring(
+                c_logits, u_logits, gen_config
+            )
+
+            # Fill all positions with predictions
+            tokens[i, :, :t_len] = pred_tokens[0]
+            all_confidence[i, :, :t_len] = confidence[0]
+
+            # Update batch_input_ids
+            batch_input_ids[i, :, c_len - t_len : c_len] = pred_tokens[0]
+            if gen_config.guidance_scale != 0:
+                batch_input_ids[B + i, :, :t_len] = pred_tokens[0]
+
+        logger.debug(
+            "Confidence iter 0 (initial): mean confidence %.4f",
+            all_confidence[all_confidence > -float("inf")].mean().item(),
+        )
+
+        # --- Phase 2: Iterative re-masking loop ---
+        threshold = gen_config.confidence_threshold
+
+        for iteration in range(gen_config.confidence_max_iter):
+            any_remasked = False
+
+            for i in range(B):
+                t_len = task.target_lens[i]
+                conf = all_confidence[i, :, :t_len]  # (C, t_len)
+                total = C * t_len
+
+                # Identify low-confidence positions
+                low_conf_mask = conf < threshold
+
+                num_low = low_conf_mask.sum().item()
+                frac_low = num_low / total
+
+                # Early exit for this item if few positions remain
+                if frac_low < gen_config.confidence_min_remask_frac:
+                    continue
+
+                # Safety: if almost all positions are low-confidence,
+                # keep the top 10% to provide useful context
+                if num_low > 0.9 * total:
+                    flat_conf = conf.flatten()
+                    keep_k = max(1, int(0.1 * total))
+                    _, keep_idx = torch.topk(flat_conf, keep_k)
+                    keep_mask = torch.zeros(total, dtype=torch.bool, device=self.device)
+                    keep_mask[keep_idx] = True
+                    low_conf_mask = low_conf_mask.flatten()
+                    low_conf_mask[keep_mask] = False
+                    low_conf_mask = low_conf_mask.view(C, t_len)
+
+                any_remasked = True
+
+                # Re-mask low-confidence positions
+                sample_tokens = tokens[i, :, :t_len]
+                sample_tokens[low_conf_mask] = self.config.audio_mask_id
+                tokens[i, :, :t_len] = sample_tokens
+
+                c_len = c_lens[i]
+                batch_input_ids[i, :, c_len - t_len : c_len] = sample_tokens
+                if gen_config.guidance_scale != 0:
+                    batch_input_ids[B + i, :, :t_len] = sample_tokens
+
+            if not any_remasked:
+                logger.debug(
+                    "Confidence converged after %d re-mask iterations.", iteration
+                )
+                break
+
+            # Forward pass with partially-masked input
+            batch_logits = self(
+                input_ids=batch_input_ids,
+                audio_mask=batch_audio_mask,
+                attention_mask=batch_attention_mask,
+            ).logits.to(torch.float32)
+
+            for i in range(B):
+                c_len, t_len = c_lens[i], task.target_lens[i]
+
+                c_logits = batch_logits[i : i + 1, :, c_len - t_len : c_len, :]
+                u_logits = (
+                    batch_logits[B + i : B + i + 1, :, :t_len, :]
+                    if gen_config.guidance_scale != 0
+                    else None
+                )
+
+                pred_tokens, confidence = self._predict_tokens_with_scoring(
+                    c_logits, u_logits, gen_config
+                )
+
+                # Only update positions that are currently masked
+                sample_tokens = tokens[i, :, :t_len]
+                is_masked = sample_tokens == self.config.audio_mask_id
+                sample_tokens[is_masked] = pred_tokens[0][is_masked]
+                tokens[i, :, :t_len] = sample_tokens
+
+                # Update confidence for re-predicted positions
+                all_confidence[i, :, :t_len][is_masked] = confidence[0][is_masked]
+
+                # Update batch_input_ids
+                batch_input_ids[i, :, c_len - t_len : c_len] = sample_tokens
+                if gen_config.guidance_scale != 0:
+                    batch_input_ids[B + i, :, :t_len] = sample_tokens
+
+            logger.debug(
+                "Confidence iter %d: mean confidence %.4f",
+                iteration + 1,
+                all_confidence[all_confidence > -float("inf")].mean().item(),
+            )
+
+        return [tokens[i, :, : task.target_lens[i]] for i in range(B)]
+
+    def _dispatch_generate(
+        self, task: GenerationTask, gen_config: OmniVoiceGenerationConfig
+    ) -> List[torch.Tensor]:
+        """Dispatch to the appropriate generation strategy."""
+        if gen_config.iterative_strategy == "confidence":
+            return self._generate_iterative_confidence(task, gen_config)
+        return self._generate_iterative(task, gen_config)
 
 
 # ---------------------------------------------------------------------------
