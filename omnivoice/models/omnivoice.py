@@ -524,18 +524,17 @@ class OmniVoice(PreTrainedModel):
             loss = audio_loss
 
         # Duration prediction loss
-        # Detach hidden_states so the duration head learns from features
-        # naturally produced by the backbone (shaped by audio loss), without
-        # the duration gradient altering backbone representations.  This
-        # prevents a train/inference gap where the backbone only produces
-        # duration-useful features when the duration loss is in the graph.
+        # The <|audio_token_len|> position has a causal attention constraint
+        # so it cannot see subsequent audio tokens.  This makes it safe for
+        # the duration gradient to flow back into the LLM backbone, allowing
+        # it to learn text representations useful for duration prediction.
         dur_logits_out = None
         dur_targets_out = None
         if num_audio_tokens is not None and document_ids is not None:
             # Remove batch dim: [1, num_docs] -> [num_docs]
             num_audio_tokens = num_audio_tokens.squeeze(0)
             boundary_hidden, doc_valid = self._extract_text_boundary_hidden(
-                hidden_states.detach(), audio_mask, document_ids
+                hidden_states, audio_mask, document_ids
             )
             if doc_valid.any():
                 dur_logits = self.duration_head(
