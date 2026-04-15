@@ -260,7 +260,15 @@ class OmniTrainer:
         logger.info(f"Running evaluation at step {self.global_step}...")
 
         local_loss_sum = torch.tensor(0.0, device=self.accelerator.device)
+        local_dur_loss_sum = torch.tensor(0.0, device=self.accelerator.device)
+        local_dur_correct = torch.tensor(0, device=self.accelerator.device)
+        local_dur_count = torch.tensor(0, device=self.accelerator.device)
+        local_dur_mae_sum = torch.tensor(0.0, device=self.accelerator.device)
         eval_count = 0
+
+        # Access duration_bins from the unwrapped model
+        unwrapped = self.accelerator.unwrap_model(self.model)
+        duration_bins = unwrapped.duration_bins
 
         with torch.no_grad():
             for eval_batch in self.eval_dataloader:
@@ -269,17 +277,56 @@ class OmniTrainer:
                 local_loss_sum += outputs.loss.detach()
                 eval_count += 1
 
+                if outputs.duration_loss is not None:
+                    local_dur_loss_sum += outputs.duration_loss.detach()
+
+                if (
+                    outputs.duration_logits is not None
+                    and outputs.duration_targets is not None
+                ):
+                    pred_bins = outputs.duration_logits.argmax(dim=-1)
+                    targets = outputs.duration_targets
+                    n = targets.numel()
+                    local_dur_count += n
+                    local_dur_correct += (pred_bins == targets).sum()
+                    # MAE in token counts
+                    pred_tokens = duration_bins[pred_bins]
+                    target_tokens = duration_bins[targets]
+                    local_dur_mae_sum += (pred_tokens - target_tokens).abs().sum()
+
         if eval_count > 0:
             local_mean = local_loss_sum / eval_count
+            local_dur_mean = local_dur_loss_sum / eval_count
         else:
             local_mean = torch.tensor(0.0, device=self.accelerator.device)
+            local_dur_mean = torch.tensor(0.0, device=self.accelerator.device)
 
         all_means = self.accelerator.gather(local_mean)
         final_eval_loss = all_means.mean().item()
 
-        eval_metrics = {"eval/loss": final_eval_loss}
+        all_dur_means = self.accelerator.gather(local_dur_mean)
+        final_dur_loss = all_dur_means.mean().item()
+
+        all_dur_correct = self.accelerator.gather(local_dur_correct).sum().item()
+        all_dur_count = self.accelerator.gather(local_dur_count).sum().item()
+        all_dur_mae = self.accelerator.gather(local_dur_mae_sum).sum().item()
+
+        dur_accuracy = all_dur_correct / all_dur_count if all_dur_count > 0 else 0.0
+        dur_mae = all_dur_mae / all_dur_count if all_dur_count > 0 else 0.0
+
+        eval_metrics = {
+            "eval/loss": final_eval_loss,
+            "eval/duration_loss": final_dur_loss,
+            "eval/duration_accuracy": dur_accuracy,
+            "eval/duration_mae_tokens": dur_mae,
+        }
         self.accelerator.log(eval_metrics, step=self.global_step)
-        logger.info(f"Eval Loss: {final_eval_loss:.4f}")
+        logger.info(
+            f"Eval Loss: {final_eval_loss:.4f} | "
+            f"Duration Loss: {final_dur_loss:.4f} | "
+            f"Duration Acc: {dur_accuracy:.4f} | "
+            f"Duration MAE: {dur_mae:.1f} tokens"
+        )
 
         self.accelerator.wait_for_everyone()
         self.model.train()

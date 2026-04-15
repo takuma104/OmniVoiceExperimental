@@ -148,6 +148,8 @@ class OmniVoiceModelOutput(ModelOutput):
     loss: Optional[torch.Tensor] = None
     logits: Optional[torch.Tensor] = None
     duration_loss: Optional[torch.Tensor] = None
+    duration_logits: Optional[torch.Tensor] = None
+    duration_targets: Optional[torch.Tensor] = None
 
 
 # ---------------------------------------------------------------------------
@@ -518,6 +520,8 @@ class OmniVoice(PreTrainedModel):
         # the duration gradient altering backbone representations.  This
         # prevents a train/inference gap where the backbone only produces
         # duration-useful features when the duration loss is in the graph.
+        dur_logits_out = None
+        dur_targets_out = None
         if num_audio_tokens is not None and document_ids is not None:
             # Remove batch dim: [1, num_docs] -> [num_docs]
             num_audio_tokens = num_audio_tokens.squeeze(0)
@@ -535,6 +539,8 @@ class OmniVoice(PreTrainedModel):
                 duration_loss = torch.nn.functional.cross_entropy(
                     dur_logits, dur_targets
                 )
+                dur_logits_out = dur_logits.detach()
+                dur_targets_out = dur_targets.detach()
                 if loss is not None:
                     loss = loss + self.config.duration_loss_weight * duration_loss
 
@@ -542,6 +548,8 @@ class OmniVoice(PreTrainedModel):
             loss=loss,
             logits=audio_logits,
             duration_loss=duration_loss,
+            duration_logits=dur_logits_out,
+            duration_targets=dur_targets_out,
         )
 
     def supported_language_ids(self) -> set[str]:
