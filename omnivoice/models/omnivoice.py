@@ -455,9 +455,18 @@ class OmniVoice(PreTrainedModel):
         inputs_embeds = self._prepare_embed_inputs(input_ids, audio_mask)
 
         if attention_mask is None and document_ids is not None:
+            # Identify <|audio_token_len|> positions so they receive a
+            # causal constraint (cannot attend to subsequent audio tokens).
+            causal_positions = None
+            if self.config.audio_len_token_id is not None:
+                causal_positions = (
+                    input_ids[0, 0, :] == self.config.audio_len_token_id
+                ).to(inputs_embeds.device)
+
             attention_mask = create_block_mask(
                 _get_packed_mask(
                     document_ids[0].to(inputs_embeds.device),
+                    causal_positions=causal_positions,
                 ),
                 B=None,
                 H=None,
@@ -1488,7 +1497,9 @@ class OmniVoice(PreTrainedModel):
 # ---------------------------------------------------------------------------
 
 
-def _get_packed_mask(document_ids):
+def _get_packed_mask(document_ids, causal_positions=None):
+    if causal_positions is not None:
+        return partial(_mask_mod_packed_with_causal, document_ids, causal_positions)
     return partial(_mask_mod_packed, document_ids)
 
 
@@ -1498,6 +1509,17 @@ def _mask_mod_packed(document_ids, b, h, q_idx, kv_idx):
     # (if handled correctly) or be ignored.
     same_doc = document_ids[q_idx] == document_ids[kv_idx]
     return same_doc
+
+
+def _mask_mod_packed_with_causal(document_ids, causal_positions, b, h, q_idx, kv_idx):
+    # Same-document constraint (bidirectional for most positions).
+    same_doc = document_ids[q_idx] == document_ids[kv_idx]
+    # When the query is at a causal position (e.g. <|audio_token_len|>),
+    # restrict attention to positions at or before it so it cannot peek
+    # at the audio region that follows.  This aligns training with
+    # inference where no audio tokens exist yet.
+    is_causal_q = causal_positions[q_idx]
+    return same_doc & (~is_causal_q | (kv_idx <= q_idx))
 
 
 def _resolve_language(language: Optional[str]) -> Union[str, None]:
