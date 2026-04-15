@@ -455,18 +455,10 @@ class OmniVoice(PreTrainedModel):
         inputs_embeds = self._prepare_embed_inputs(input_ids, audio_mask)
 
         if attention_mask is None and document_ids is not None:
-            # Identify <|audio_token_len|> positions so they receive a
-            # causal constraint (cannot attend to subsequent audio tokens).
-            causal_positions = None
-            if self.config.audio_len_token_id is not None:
-                causal_positions = (
-                    input_ids[0, 0, :] == self.config.audio_len_token_id
-                ).to(inputs_embeds.device)
-
             attention_mask = create_block_mask(
                 _get_packed_mask(
                     document_ids[0].to(inputs_embeds.device),
-                    causal_positions=causal_positions,
+                    audio_mask=audio_mask[0].to(inputs_embeds.device),
                 ),
                 B=None,
                 H=None,
@@ -524,10 +516,9 @@ class OmniVoice(PreTrainedModel):
             loss = audio_loss
 
         # Duration prediction loss
-        # The <|audio_token_len|> position has a causal attention constraint
-        # so it cannot see subsequent audio tokens.  This makes it safe for
-        # the duration gradient to flow back into the LLM backbone, allowing
-        # it to learn text representations useful for duration prediction.
+        # Text positions are blocked from attending to audio positions
+        # (see _mask_mod_packed_with_causal), so the duration gradient
+        # can safely flow back into the LLM backbone.
         dur_logits_out = None
         dur_targets_out = None
         if num_audio_tokens is not None and document_ids is not None:
@@ -1496,9 +1487,9 @@ class OmniVoice(PreTrainedModel):
 # ---------------------------------------------------------------------------
 
 
-def _get_packed_mask(document_ids, causal_positions=None):
-    if causal_positions is not None:
-        return partial(_mask_mod_packed_with_causal, document_ids, causal_positions)
+def _get_packed_mask(document_ids, audio_mask=None):
+    if audio_mask is not None:
+        return partial(_mask_mod_packed_with_causal, document_ids, audio_mask)
     return partial(_mask_mod_packed, document_ids)
 
 
@@ -1510,15 +1501,16 @@ def _mask_mod_packed(document_ids, b, h, q_idx, kv_idx):
     return same_doc
 
 
-def _mask_mod_packed_with_causal(document_ids, causal_positions, b, h, q_idx, kv_idx):
-    # Same-document constraint (bidirectional for most positions).
+def _mask_mod_packed_with_causal(document_ids, audio_mask, b, h, q_idx, kv_idx):
     same_doc = document_ids[q_idx] == document_ids[kv_idx]
-    # When the query is at a causal position (e.g. <|audio_token_len|>),
-    # restrict attention to positions at or before it so it cannot peek
-    # at the audio region that follows.  This aligns training with
-    # inference where no audio tokens exist yet.
-    is_causal_q = causal_positions[q_idx]
-    return same_doc & (~is_causal_q | (kv_idx <= q_idx))
+    # Block text positions from attending to audio positions.
+    # Without this, audio information leaks into text hidden states
+    # via bidirectional attention, and then reaches <|audio_token_len|>
+    # indirectly across transformer layers -- making the duration head
+    # "cheat" during training while failing at inference.
+    is_text_q = ~audio_mask[q_idx]
+    is_audio_kv = audio_mask[kv_idx]
+    return same_doc & ~(is_text_q & is_audio_kv)
 
 
 def _resolve_language(language: Optional[str]) -> Union[str, None]:
