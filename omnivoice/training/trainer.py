@@ -261,14 +261,9 @@ class OmniTrainer:
 
         local_loss_sum = torch.tensor(0.0, device=self.accelerator.device)
         local_dur_loss_sum = torch.tensor(0.0, device=self.accelerator.device)
-        local_dur_correct = torch.tensor(0, device=self.accelerator.device)
         local_dur_count = torch.tensor(0, device=self.accelerator.device)
         local_dur_mae_sum = torch.tensor(0.0, device=self.accelerator.device)
         eval_count = 0
-
-        # Access duration_bins from the unwrapped model
-        unwrapped = self.accelerator.unwrap_model(self.model)
-        duration_bins = unwrapped.duration_bins
 
         with torch.no_grad():
             for eval_batch in self.eval_dataloader:
@@ -281,18 +276,21 @@ class OmniTrainer:
                     local_dur_loss_sum += outputs.duration_loss.detach()
 
                 if (
-                    outputs.duration_logits is not None
+                    outputs.duration_preds is not None
                     and outputs.duration_targets is not None
                 ):
-                    pred_bins = outputs.duration_logits.argmax(dim=-1)
+                    # Compute MAE in token space on boundary positions only.
+                    # The last prediction per document corresponds to the
+                    # <|audio_token_len|> position whose target equals
+                    # log1p(num_audio_tokens).
+                    preds = outputs.duration_preds
                     targets = outputs.duration_targets
-                    n = targets.numel()
-                    local_dur_count += n
-                    local_dur_correct += (pred_bins == targets).sum()
-                    # MAE in token counts
-                    pred_tokens = duration_bins[pred_bins]
-                    target_tokens = duration_bins[targets]
-                    local_dur_mae_sum += (pred_tokens - target_tokens).abs().sum()
+                    pred_tokens = torch.expm1(preds)
+                    target_tokens = torch.expm1(targets)
+                    local_dur_count += target_tokens.numel()
+                    local_dur_mae_sum += (
+                        (pred_tokens - target_tokens).abs().sum()
+                    )
 
         if eval_count > 0:
             local_mean = local_loss_sum / eval_count
@@ -307,24 +305,20 @@ class OmniTrainer:
         all_dur_means = self.accelerator.gather(local_dur_mean)
         final_dur_loss = all_dur_means.mean().item()
 
-        all_dur_correct = self.accelerator.gather(local_dur_correct).sum().item()
         all_dur_count = self.accelerator.gather(local_dur_count).sum().item()
         all_dur_mae = self.accelerator.gather(local_dur_mae_sum).sum().item()
 
-        dur_accuracy = all_dur_correct / all_dur_count if all_dur_count > 0 else 0.0
         dur_mae = all_dur_mae / all_dur_count if all_dur_count > 0 else 0.0
 
         eval_metrics = {
             "eval/loss": final_eval_loss,
             "eval/duration_loss": final_dur_loss,
-            "eval/duration_accuracy": dur_accuracy,
             "eval/duration_mae_tokens": dur_mae,
         }
         self.accelerator.log(eval_metrics, step=self.global_step)
         logger.info(
             f"Eval Loss: {final_eval_loss:.4f} | "
             f"Duration Loss: {final_dur_loss:.4f} | "
-            f"Duration Acc: {dur_accuracy:.4f} | "
             f"Duration MAE: {dur_mae:.1f} tokens"
         )
 

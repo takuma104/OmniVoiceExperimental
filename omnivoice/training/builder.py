@@ -93,7 +93,6 @@ def build_model_and_tokenizer(
             audio_mask_id=config.audio_mask_id,
             num_audio_codebook=config.num_audio_codebook,
             audio_codebook_weights=config.audio_codebook_weights,
-            num_duration_bins=config.num_duration_bins,
             max_duration_tokens=config.max_duration_tokens,
             duration_loss_weight=config.duration_loss_weight,
             llm_config=llm_config,

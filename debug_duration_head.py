@@ -2,8 +2,8 @@
 
 Loads a checkpoint and a training batch, then inspects:
 1. Boundary extraction correctness (positions, valid_mask, <|audio_token_len|> marker)
-2. Duration bin targets (histogram of bucketized values)
-3. Duration head output distribution (logits, predicted vs actual)
+2. Duration regression targets (linear interpolation in log1p scale)
+3. Duration head output distribution (predicted vs actual token counts)
 4. Comparison of training-mode vs inference-mode predictions
 5. Hidden state comparison between training-path and inference-path
 """
@@ -33,13 +33,13 @@ def build_synthetic_batch(model, tokenizer, num_samples: int = 4):
         text_tokenizer=tokenizer,
         num_channels=model.config.num_audio_codebook,
         audio_mask_id=model.config.audio_mask_id,
-        prompt_ratio_range=(0.1, 0.2),
-        mask_ratio_range=(0.5, 1.0),
+        prompt_ratio_range=(0.0, 0.3),
+        mask_ratio_range=(0.0, 1.0),
         drop_cond_ratio=0.0,  # no drop_cond so all docs have text boundary
-        language_ratio=0.8,
+        language_ratio=0.0,
         use_pinyin_ratio=0.0,
-        instruct_ratio=1.0,
-        only_instruct_ratio=0.5,
+        instruct_ratio=0.0,
+        only_instruct_ratio=0.0,
     )
 
     samples = []
@@ -73,9 +73,9 @@ def build_synthetic_batch(model, tokenizer, num_samples: int = 4):
 
 
 def inspect_boundary_extraction(model, batch):
-    """Run _extract_text_boundary_hidden and print diagnostics."""
+    """Run forward pass and print text position diagnostics."""
     print("=" * 60)
-    print("1. Boundary Extraction Diagnostics")
+    print("1. Text Position Diagnostics")
     print("=" * 60)
 
     device = next(model.parameters()).device
@@ -91,11 +91,6 @@ def inspect_boundary_extraction(model, batch):
     )
     hidden_states = llm_outputs[0]
 
-    # Extract boundaries
-    boundary_hidden, valid_mask = model._extract_text_boundary_hidden(
-        hidden_states, audio_mask, document_ids,
-    )
-
     doc_ids = document_ids[0]
     a_mask = audio_mask[0]
     unique_docs = doc_ids[doc_ids >= 0].unique()
@@ -106,7 +101,6 @@ def inspect_boundary_extraction(model, batch):
 
     print(f"  Sequence length: {doc_ids.shape[0]}")
     print(f"  Num documents:   {unique_docs.numel()}")
-    print(f"  Valid docs:      {valid_mask.sum().item()} / {valid_mask.numel()}")
     if audio_len_token_id is not None:
         marker_positions = (layer0_ids == audio_len_token_id).nonzero(
             as_tuple=False
@@ -145,86 +139,67 @@ def inspect_boundary_extraction(model, batch):
               if audio_indices.numel() > 0 else "    Audio positions: 0")
         print(f"    Boundary index:  {boundary_idx}")
         print(f"    Boundary is <|audio_token_len|>: {is_marker}")
-        print(f"    Valid:           {valid_mask[d.item()].item()}")
     print()
 
-    return hidden_states, boundary_hidden, valid_mask
+    return hidden_states
 
 
-def inspect_duration_targets(model, batch):
-    """Visualize bucketized target distribution."""
+def inspect_duration_targets(batch, audio_lengths):
+    """Visualize linear interpolation targets."""
     print("=" * 60)
-    print("2. Duration Target Binning")
+    print("2. Duration Regression Targets (linear interpolation, log1p scale)")
     print("=" * 60)
 
-    num_audio_tokens = batch["num_audio_tokens"].squeeze(0)
-    duration_bins = model.duration_bins
+    doc_ids = batch["document_ids"][0]
+    a_mask = batch["audio_mask"][0]
+    unique_docs = doc_ids[doc_ids >= 0].unique()
 
-    print(f"  Duration bins range: [{duration_bins[0].item():.1f}, "
-          f"{duration_bins[-1].item():.1f}]")
-    print(f"  Num bins: {duration_bins.numel()}")
+    for d_idx, d in enumerate(unique_docs):
+        text_positions = (doc_ids == d) & ~a_mask
+        k = text_positions.sum().item()
+        n_audio = audio_lengths[d_idx]
+
+        targets_raw = torch.arange(1, k + 1).float() / k * n_audio
+        targets_log = targets_raw.log1p()
+
+        print(f"  Doc {d_idx}: num_text={k}, num_audio={n_audio}")
+        print(f"    First target:    {targets_raw[0].item():.1f} tokens "
+              f"(log1p={targets_log[0].item():.4f})")
+        print(f"    Boundary target: {targets_raw[-1].item():.1f} tokens "
+              f"(log1p={targets_log[-1].item():.4f})")
     print()
 
-    targets = torch.bucketize(
-        num_audio_tokens.float().to(duration_bins.device),
-        duration_bins,
-    ).clamp(0, model.config.num_duration_bins - 1)
 
-    for i, (n, t) in enumerate(zip(num_audio_tokens.tolist(), targets.tolist())):
-        bin_val = duration_bins[t].item()
-        print(f"  Doc {i}: num_audio_tokens={n:4d} -> bin_idx={t:3d} "
-              f"(bin_center={bin_val:.1f})")
-    print()
-
-    return targets
-
-
-def inspect_duration_head_output(model, boundary_hidden, valid_mask, targets):
-    """Check what the duration head actually predicts."""
+def inspect_duration_head_output(model, hidden_states, batch, audio_lengths):
+    """Check what the duration head predicts at each document's boundary."""
     print("=" * 60)
     print("3. Duration Head Predictions (training-mode hidden states)")
     print("=" * 60)
 
-    if not valid_mask.any():
-        print("  No valid documents - skipping")
-        return
+    doc_ids = batch["document_ids"][0]
+    a_mask = batch["audio_mask"][0]
+    hs = hidden_states[0]
+    unique_docs = doc_ids[doc_ids >= 0].unique()
 
     with torch.no_grad():
-        dur_logits = model.duration_head(boundary_hidden[valid_mask])
+        for d_idx, d in enumerate(unique_docs):
+            text_positions = (doc_ids == d) & ~a_mask
+            text_indices = text_positions.nonzero(as_tuple=False).squeeze(-1)
+            if text_indices.numel() == 0:
+                continue
 
-    probs = torch.softmax(dur_logits, dim=-1)
-    valid_targets = targets[valid_mask.to(targets.device)]
+            boundary_idx = text_indices[-1].item()
+            boundary_hs = hs[boundary_idx]
+            log_pred = model.duration_head(boundary_hs).squeeze(-1)
+            pred_tokens = torch.expm1(log_pred).item()
+            actual_tokens = audio_lengths[d_idx]
 
-    for i in range(dur_logits.shape[0]):
-        pred_bin = dur_logits[i].argmax().item()
-        pred_val = model.duration_bins[pred_bin].item()
-        true_bin = valid_targets[i].item()
-        true_val = model.duration_bins[true_bin].item()
-        target_prob = probs[i, true_bin].item()
-        pred_prob = probs[i, pred_bin].item()
-
-        print(f"  Doc {i}:")
-        print(f"    Predicted: bin={pred_bin:3d} (value={pred_val:.1f}, "
-              f"prob={pred_prob:.4f})")
-        print(f"    Actual:    bin={true_bin:3d} (value={true_val:.1f}, "
-              f"prob={target_prob:.4f})")
-        print(f"    Match:     {'YES' if pred_bin == true_bin else 'NO'}")
-
-        # Top-5 bins
-        top5 = torch.topk(probs[i], 5)
-        top5_str = ", ".join(
-            f"bin {idx.item()}({model.duration_bins[idx].item():.0f})="
-            f"{p.item():.3f}"
-            for p, idx in zip(top5.values, top5.indices)
-        )
-        print(f"    Top-5:     {top5_str}")
-    print()
-
-    # Cross-entropy loss
-    loss = torch.nn.functional.cross_entropy(
-        dur_logits, valid_targets.to(dur_logits.device)
-    )
-    print(f"  Cross-entropy loss: {loss.item():.6f}")
+            print(f"  Doc {d_idx}:")
+            print(f"    Predicted: {pred_tokens:.1f} tokens "
+                  f"(log1p={log_pred.item():.4f})")
+            print(f"    Actual:    {actual_tokens} tokens "
+                  f"(log1p={torch.tensor(float(actual_tokens)).log1p().item():.4f})")
+            print(f"    Error:     {abs(pred_tokens - actual_tokens):.1f} tokens")
     print()
 
 
@@ -330,27 +305,16 @@ def inspect_hidden_state_comparison(model, batch, texts):
 
     # Compare duration head outputs for both
     with torch.no_grad():
-        train_logits = model.duration_head(train_boundary_hs)
-        infer_logits = model.duration_head(infer_boundary_hs)
+        train_log_pred = model.duration_head(train_boundary_hs).squeeze(-1)
+        infer_log_pred = model.duration_head(infer_boundary_hs).squeeze(-1)
 
-    train_pred = train_logits.argmax().item()
-    infer_pred = infer_logits.argmax().item()
-    train_probs = torch.softmax(train_logits, dim=-1)
-    infer_probs = torch.softmax(infer_logits, dim=-1)
+    train_tokens = torch.expm1(train_log_pred).item()
+    infer_tokens = torch.expm1(infer_log_pred).item()
 
     print(f"  Duration head on training-path hs:")
-    print(f"    Predicted bin: {train_pred} "
-          f"(value={model.duration_bins[train_pred].item():.1f}, "
-          f"prob={train_probs[train_pred].item():.4f})")
+    print(f"    Predicted: {train_tokens:.1f} tokens (log1p={train_log_pred.item():.4f})")
     print(f"  Duration head on inference-path hs:")
-    print(f"    Predicted bin: {infer_pred} "
-          f"(value={model.duration_bins[infer_pred].item():.1f}, "
-          f"prob={infer_probs[infer_pred].item():.4f})")
-
-    logits_cos = torch.nn.functional.cosine_similarity(
-        train_logits.unsqueeze(0), infer_logits.unsqueeze(0)
-    ).item()
-    print(f"    Logits cosine similarity:   {logits_cos:.6f}")
+    print(f"    Predicted: {infer_tokens:.1f} tokens (log1p={infer_log_pred.item():.4f})")
     print()
 
 
@@ -383,16 +347,14 @@ def main():
     print(f"  Audio lengths: {audio_lengths}")
     print()
 
-    # 1. Boundary extraction
-    hidden_states, boundary_hidden, valid_mask = inspect_boundary_extraction(
-        model, batch,
-    )
+    # 1. Text position diagnostics
+    hidden_states = inspect_boundary_extraction(model, batch)
 
-    # 2. Target binning
-    targets = inspect_duration_targets(model, batch)
+    # 2. Target visualization
+    inspect_duration_targets(batch, audio_lengths)
 
     # 3. Duration head predictions from training hidden states
-    inspect_duration_head_output(model, boundary_hidden, valid_mask, targets)
+    inspect_duration_head_output(model, hidden_states, batch, audio_lengths)
 
     # 4. Inference-mode predictions
     inspect_inference_mode(model, texts)
