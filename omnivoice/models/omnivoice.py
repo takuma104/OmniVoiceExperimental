@@ -1349,8 +1349,16 @@ class OmniVoice(PreTrainedModel):
             batch_input_ids[i, :, :c_len] = inp["input_ids"]
             batch_audio_mask[i, :c_len] = inp["audio_mask"]
             batch_attention_mask[i, :, :c_len, :c_len] = True
+            # Block text→audio attention to match the training-time mask in
+            # _mask_mod_packed_with_causal. Without this, text hidden states
+            # get contaminated by audio (mostly MASK) tokens at inference,
+            # shifting the K/V the audio positions attend to away from the
+            # distribution the model was trained on.
+            cond_audio_mask_1d = inp["audio_mask"][0]  # [c_len]
+            text_to_audio = (~cond_audio_mask_1d).unsqueeze(-1) & cond_audio_mask_1d.unsqueeze(0)
+            batch_attention_mask[i, 0, :c_len, :c_len] &= ~text_to_audio
 
-            # Uncond (B ~ 2B-1)
+            # Uncond (B ~ 2B-1): audio-only region, no text→audio to block.
             batch_input_ids[B + i, :, :u_len] = inp["input_ids"][..., -u_len:]
             batch_audio_mask[B + i, :u_len] = inp["audio_mask"][..., -u_len:]
             batch_attention_mask[B + i, :, :u_len, :u_len] = True
