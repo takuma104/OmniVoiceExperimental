@@ -287,7 +287,7 @@ class OmniTrainer:
                 ):
                     # Compute MAE in token space on boundary positions only.
                     # The last prediction per document corresponds to the
-                    # final text position (<|text_end|>) whose target equals
+                    # <|audio_token_len|> position whose target equals
                     # log1p(num_audio_tokens).
                     preds = outputs.duration_preds
                     targets = outputs.duration_targets

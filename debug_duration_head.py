@@ -1,7 +1,7 @@
 """Debug script for duration head training diagnostics.
 
 Loads a checkpoint and a training batch, then inspects:
-1. Boundary extraction correctness (positions, valid_mask, <|text_end|> marker)
+1. Boundary extraction correctness (positions, valid_mask, <|audio_token_len|> marker)
 2. Duration regression targets (linear interpolation in log1p scale)
 3. Duration head output distribution (predicted vs actual token counts)
 4. Comparison of training-mode vs inference-mode predictions
@@ -95,17 +95,20 @@ def inspect_boundary_extraction(model, batch):
     a_mask = audio_mask[0]
     unique_docs = doc_ids[doc_ids >= 0].unique()
 
-    # Check if <|text_end|> token is present at each document boundary
-    text_end_token_id = model.text_tokenizer.convert_tokens_to_ids("<|text_end|>")
+    # Check if <|audio_token_len|> token is present
+    audio_len_token_id = model.config.audio_len_token_id
     layer0_ids = input_ids[0, 0, :]  # text token IDs (layer 0)
 
     print(f"  Sequence length: {doc_ids.shape[0]}")
     print(f"  Num documents:   {unique_docs.numel()}")
-    marker_positions = (layer0_ids == text_end_token_id).nonzero(
-        as_tuple=False
-    ).squeeze(-1)
-    print(f"  <|text_end|> token ID: {text_end_token_id}")
-    print(f"  <|text_end|> positions: {marker_positions.tolist()}")
+    if audio_len_token_id is not None:
+        marker_positions = (layer0_ids == audio_len_token_id).nonzero(
+            as_tuple=False
+        ).squeeze(-1)
+        print(f"  <|audio_token_len|> token ID: {audio_len_token_id}")
+        print(f"  <|audio_token_len|> positions: {marker_positions.tolist()}")
+    else:
+        print("  <|audio_token_len|> token ID: NOT SET in config")
     print()
 
     for d in unique_docs:
@@ -118,7 +121,11 @@ def inspect_boundary_extraction(model, batch):
         if text_indices.numel() > 0:
             boundary_idx = text_indices[-1].item()
             boundary_token_id = layer0_ids[boundary_idx].item()
-            is_marker = boundary_token_id == text_end_token_id
+            is_marker = (
+                boundary_token_id == audio_len_token_id
+                if audio_len_token_id is not None
+                else "N/A"
+            )
         else:
             boundary_idx = None
             is_marker = False
@@ -131,7 +138,7 @@ def inspect_boundary_extraction(model, batch):
               f"(range {audio_indices[0].item()}-{audio_indices[-1].item()})"
               if audio_indices.numel() > 0 else "    Audio positions: 0")
         print(f"    Boundary index:  {boundary_idx}")
-        print(f"    Boundary is <|text_end|>: {is_marker}")
+        print(f"    Boundary is <|audio_token_len|>: {is_marker}")
     print()
 
     return hidden_states
@@ -218,9 +225,9 @@ def inspect_hidden_state_comparison(model, batch, texts):
     """Compare hidden states from training-path vs inference-path.
 
     For the first document in the packed batch, extracts the text-only
-    tokens and runs a separate forward pass mimicking the inference
-    _predict_duration path. Then compares the hidden states at the final
-    text position (<|text_end|>).
+    tokens (including <|audio_token_len|>) and runs a separate forward pass
+    mimicking the inference _predict_duration path. Then compares the
+    hidden states at the <|audio_token_len|> position.
     """
     print("=" * 60)
     print("5. Hidden State Comparison (training-path vs inference-path)")
@@ -272,7 +279,7 @@ def inspect_hidden_state_comparison(model, batch, texts):
             inputs_embeds=text_embeds, return_dict=True
         )[0]
 
-    infer_boundary_hs = infer_hidden[0, -1, :]  # last position = <|text_end|>
+    infer_boundary_hs = infer_hidden[0, -1, :]  # last position = <|audio_token_len|>
 
     # --- Comparison ---
     cos_sim = torch.nn.functional.cosine_similarity(
@@ -284,12 +291,12 @@ def inspect_hidden_state_comparison(model, batch, texts):
     infer_norm = infer_boundary_hs.norm().item()
 
     # Check what token is at the boundary
-    text_end_token_id = model.text_tokenizer.convert_tokens_to_ids("<|text_end|>")
+    audio_len_token_id = model.config.audio_len_token_id
     boundary_token = input_ids[0, 0, boundary_idx].item()
-    is_marker = boundary_token == text_end_token_id
+    is_marker = boundary_token == audio_len_token_id if audio_len_token_id else "N/A"
 
     print(f"  Doc 0 boundary (pos {boundary_idx}, "
-          f"is <|text_end|>: {is_marker}):")
+          f"is <|audio_token_len|>: {is_marker}):")
     print(f"    Training-path hidden norm:  {train_norm:.4f}")
     print(f"    Inference-path hidden norm: {infer_norm:.4f}")
     print(f"    Cosine similarity:          {cos_sim:.6f}")

@@ -169,6 +169,7 @@ class OmniVoiceConfig(PretrainedConfig):
         audio_codebook_weights: Optional[list[float]] = None,
         max_duration_tokens: int = 500,
         duration_loss_weight: float = 0.1,
+        audio_len_token_id: Optional[int] = None,
         llm_config: Optional[Union[dict, PretrainedConfig]] = None,
         **kwargs,
     ):
@@ -187,6 +188,7 @@ class OmniVoiceConfig(PretrainedConfig):
         self.audio_codebook_weights = audio_codebook_weights
         self.max_duration_tokens = max_duration_tokens
         self.duration_loss_weight = duration_loss_weight
+        self.audio_len_token_id = audio_len_token_id
 
 
 class OmniVoice(PreTrainedModel):
@@ -1119,11 +1121,11 @@ class OmniVoice(PreTrainedModel):
     ) -> int:
         """Predict audio token count using the learned duration head.
 
-        Builds a ``[style | text]`` token sequence that matches the
-        training-time prefix produced by ``OmniVoiceSampleProcessor``, runs
-        one LLM forward pass, and uses ``duration_head`` on the last text
-        position (``<|text_end|>``) hidden state to regress the expected
-        audio length.
+        Builds a ``[style | text | <|audio_token_len|>]`` token sequence that
+        matches the training-time prefix produced by
+        ``OmniVoiceSampleProcessor``, runs one LLM forward pass, and
+        uses ``duration_head`` on the ``<|audio_token_len|>`` position's hidden
+        state to regress the expected audio length.
         """
         # Build style tokens — must match processor format exactly
         lang_str = lang if lang else "None"
@@ -1143,7 +1145,14 @@ class OmniVoice(PreTrainedModel):
             wrapped_text, return_tensors="pt"
         ).input_ids.to(self.device)  # [1, N2]
 
-        input_ids = torch.cat([style_tokens, text_tokens], dim=1)  # [1, N]
+        # Duration marker — matches training sequence format
+        audio_len_token = self.text_tokenizer(
+            "<|audio_token_len|>", return_tensors="pt"
+        ).input_ids.to(self.device)  # [1, 1]
+
+        input_ids = torch.cat(
+            [style_tokens, text_tokens, audio_len_token], dim=1
+        )  # [1, N]
         seq_len = input_ids.size(1)
 
         # Expand to [1, C, N] with layer 0 = text tokens
@@ -1162,7 +1171,7 @@ class OmniVoice(PreTrainedModel):
         )
         hidden_states = llm_outputs[0]  # [1, N, H]
 
-        # Last text position (<|text_end|>) — the training target at this
+        # Last position is <|audio_token_len|> — the training target at this
         # position is log1p(num_audio_tokens), so expm1 recovers the count.
         last_hidden = hidden_states[0, -1, :]  # [H]
         log_pred = self.duration_head(last_hidden).squeeze(-1)  # scalar
@@ -1238,6 +1247,13 @@ class OmniVoice(PreTrainedModel):
             self.device
         )  # [1, C, N2]
 
+        # Duration marker — matches training sequence format
+        audio_len_token = (
+            self.text_tokenizer("<|audio_token_len|>", return_tensors="pt")
+            .input_ids.repeat(self.config.num_audio_codebook, 1)
+            .unsqueeze(0)
+        ).to(self.device)  # [1, C, 1]
+
         # Target: all MASK
         target_audio_tokens = torch.full(
             (1, self.config.num_audio_codebook, num_target_tokens),
@@ -1246,8 +1262,8 @@ class OmniVoice(PreTrainedModel):
             device=self.device,
         )
 
-        # Conditional input: [style | text | ref_audio? | target_audio]
-        parts = [style_tokens, text_tokens]
+        # Conditional input: [style | text | <|audio_token_len|> | ref_audio? | target_audio]
+        parts = [style_tokens, text_tokens, audio_len_token]
         if ref_audio_tokens is not None:
             parts.append(ref_audio_tokens.unsqueeze(0).to(self.device))
         parts.append(target_audio_tokens)
@@ -1479,9 +1495,9 @@ def _mask_mod_packed_with_causal(document_ids, audio_mask, b, h, q_idx, kv_idx):
     same_doc = document_ids[q_idx] == document_ids[kv_idx]
     # Block text positions from attending to audio positions.
     # Without this, audio information leaks into text hidden states
-    # via bidirectional attention, and then reaches the duration-prediction
-    # position indirectly across transformer layers -- making the duration
-    # head "cheat" during training while failing at inference.
+    # via bidirectional attention, and then reaches <|audio_token_len|>
+    # indirectly across transformer layers -- making the duration head
+    # "cheat" during training while failing at inference.
     is_text_q = ~audio_mask[q_idx]
     is_audio_kv = audio_mask[kv_idx]
     return same_doc & ~(is_text_q & is_audio_kv)

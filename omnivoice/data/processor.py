@@ -148,6 +148,12 @@ class OmniVoiceSampleProcessor:
         if not drop_cond:
             audio_labels[:, :prompt_length] = -100  # No loss on prompt region
 
+        # --- Duration marker ---
+        audio_len_inputs = self.text_tokenizer(
+            "<|audio_token_len|>", return_tensors="pt"
+        ).input_ids.repeat(self.num_channels, 1)  # [C, 1]
+        audio_len_labels = torch.full(audio_len_inputs.shape, -100)
+
         # --- Concatenation ---
         if drop_text:
             input_ids = audio_inputs
@@ -156,13 +162,17 @@ class OmniVoiceSampleProcessor:
             audio_mask = torch.ones(total_length, dtype=torch.bool)
         else:
             input_ids = torch.cat(
-                [style_inputs, text_inputs, audio_inputs], dim=1
+                [style_inputs, text_inputs, audio_len_inputs, audio_inputs], dim=1
             )
             labels = torch.cat(
-                [style_labels, text_labels, audio_labels], dim=1
+                [style_labels, text_labels, audio_len_labels, audio_labels], dim=1
             )
             total_length = input_ids.shape[1]
-            audio_start_idx = style_inputs.shape[1] + text_inputs.shape[1]
+            audio_start_idx = (
+                style_inputs.shape[1]
+                + text_inputs.shape[1]
+                + audio_len_inputs.shape[1]
+            )
             audio_mask = torch.zeros(total_length, dtype=torch.bool)
             audio_mask[audio_start_idx:] = True
 
@@ -239,6 +249,12 @@ class OmniVoiceSimpleSampleProcessor:
             # No loss on prompt region
             audio_labels[:, :prompt_length] = -100
 
+        # --- Duration marker ---
+        audio_len_inputs = self.text_tokenizer(
+            "<|audio_token_len|>", return_tensors="pt"
+        ).input_ids.repeat(self.num_channels, 1)  # [C, 1]
+        audio_len_labels = torch.full(audio_len_inputs.shape, -100)
+
         # --- Concatenation ---
         if drop_cond:
             input_ids = audio_inputs
@@ -246,10 +262,14 @@ class OmniVoiceSimpleSampleProcessor:
             total_length = input_ids.shape[1]
             audio_mask = torch.ones(total_length, dtype=torch.bool)
         else:
-            input_ids = torch.cat([text_inputs, audio_inputs], dim=1)
-            labels = torch.cat([text_labels, audio_labels], dim=1)
+            input_ids = torch.cat(
+                [text_inputs, audio_len_inputs, audio_inputs], dim=1
+            )
+            labels = torch.cat(
+                [text_labels, audio_len_labels, audio_labels], dim=1
+            )
             total_length = input_ids.shape[1]
-            audio_start_idx = text_inputs.shape[1]
+            audio_start_idx = text_inputs.shape[1] + audio_len_inputs.shape[1]
             audio_mask = torch.zeros(total_length, dtype=torch.bool)
             audio_mask[audio_start_idx:] = True
 
