@@ -70,7 +70,6 @@ def build_model_and_tokenizer(
         "<|instruct_end|>",
         "<|text_start|>",
         "<|text_end|>",
-        "<|audio_token_len|>",
     ]
 
     tokens_to_add = [t for t in new_tokens if t not in tokenizer.get_vocab()]
@@ -119,7 +118,6 @@ def build_model_and_tokenizer(
     model.config.pad_token_id = tokenizer.pad_token_id
     model.config.bos_token_id = tokenizer.bos_token_id
     model.config.eos_token_id = tokenizer.eos_token_id
-    model.config.audio_len_token_id = tokenizer.convert_tokens_to_ids("<|audio_token_len|>")
 
     return model, tokenizer
 
