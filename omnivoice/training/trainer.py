@@ -263,6 +263,12 @@ class OmniTrainer:
         local_dur_loss_sum = torch.tensor(0.0, device=self.accelerator.device)
         local_dur_count = torch.tensor(0, device=self.accelerator.device)
         local_dur_mae_sum = torch.tensor(0.0, device=self.accelerator.device)
+        local_dur_mae_min = torch.tensor(
+            float("inf"), device=self.accelerator.device
+        )
+        local_dur_mae_max = torch.tensor(
+            float("-inf"), device=self.accelerator.device
+        )
         eval_count = 0
 
         with torch.no_grad():
@@ -287,10 +293,16 @@ class OmniTrainer:
                     targets = outputs.duration_targets
                     pred_tokens = torch.expm1(preds)
                     target_tokens = torch.expm1(targets)
+                    abs_err = (pred_tokens - target_tokens).abs()
                     local_dur_count += target_tokens.numel()
-                    local_dur_mae_sum += (
-                        (pred_tokens - target_tokens).abs().sum()
-                    )
+                    local_dur_mae_sum += abs_err.sum()
+                    if abs_err.numel() > 0:
+                        local_dur_mae_min = torch.minimum(
+                            local_dur_mae_min, abs_err.min()
+                        )
+                        local_dur_mae_max = torch.maximum(
+                            local_dur_mae_max, abs_err.max()
+                        )
 
         if eval_count > 0:
             local_mean = local_loss_sum / eval_count
@@ -307,19 +319,35 @@ class OmniTrainer:
 
         all_dur_count = self.accelerator.gather(local_dur_count).sum().item()
         all_dur_mae = self.accelerator.gather(local_dur_mae_sum).sum().item()
+        all_dur_mae_min = (
+            self.accelerator.gather(local_dur_mae_min).min().item()
+        )
+        all_dur_mae_max = (
+            self.accelerator.gather(local_dur_mae_max).max().item()
+        )
 
-        dur_mae = all_dur_mae / all_dur_count if all_dur_count > 0 else 0.0
+        if all_dur_count > 0:
+            dur_mae = all_dur_mae / all_dur_count
+            dur_mae_min = all_dur_mae_min
+            dur_mae_max = all_dur_mae_max
+        else:
+            dur_mae = 0.0
+            dur_mae_min = 0.0
+            dur_mae_max = 0.0
 
         eval_metrics = {
             "eval/loss": final_eval_loss,
             "eval/duration_loss": final_dur_loss,
             "eval/duration_mae_tokens": dur_mae,
+            "eval/duration_mae_tokens_min": dur_mae_min,
+            "eval/duration_mae_tokens_max": dur_mae_max,
         }
         self.accelerator.log(eval_metrics, step=self.global_step)
         logger.info(
             f"Eval Loss: {final_eval_loss:.4f} | "
             f"Duration Loss: {final_dur_loss:.4f} | "
-            f"Duration MAE: {dur_mae:.1f} tokens"
+            f"Duration MAE: {dur_mae:.1f} tokens "
+            f"(min {dur_mae_min:.1f} / max {dur_mae_max:.1f})"
         )
 
         self.accelerator.wait_for_everyone()
