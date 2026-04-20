@@ -303,6 +303,25 @@ class OmniVoice(PreTrainedModel):
             logger.info("unexpected keys (sample): %s", unexpected[:5])
         del tmp
 
+    def freeze_predictor(self) -> None:
+        """Freeze all Predictor params (pretrained Qwen3-TTS weights).
+
+        `backbone_to_talker_proj` is a new module and stays trainable. Call
+        after `_load_predictor_pretrained` so the frozen weights reflect the
+        pretrained initialization.
+        """
+        if not getattr(self.config, "use_predictor", False):
+            return
+        n_frozen = 0
+        for p in self.predictor.parameters():
+            p.requires_grad = False
+            n_frozen += p.numel()
+        self.predictor.eval()
+        # Pin predictor to eval mode so that a later model.train() from the
+        # trainer loop doesn't re-enable dropout on the frozen submodule.
+        self.predictor.train = lambda mode=True: self.predictor
+        logger.info("Froze Predictor params: %d", n_frozen)
+
     @property
     def audio_frame_rate(self) -> float:
         return 12.5  # frame_rate for Qwen3-TTS-Tokenizer-12Hz

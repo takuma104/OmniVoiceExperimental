@@ -139,6 +139,9 @@ def build_model_and_tokenizer(
         # to the target dtype. LLM and Predictor are already loaded at param_dtype.
         model.to(param_dtype)
 
+    if config.use_predictor and config.freeze_predictor:
+        model.freeze_predictor()
+
     # 3. Resize Embeddings
     if len(tokenizer) != model.config.llm_config.vocab_size:
         model.llm.resize_token_embeddings(len(tokenizer))

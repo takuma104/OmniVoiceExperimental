@@ -54,6 +54,9 @@ class TrainingConfig:
     # Cascaded Predictor (Qwen3TTSTalkerCodePredictor for cb1..C-1)
     use_predictor: bool = False
     predictor_pretrained_path: Optional[str] = None  # e.g. "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
+    # Freeze all Predictor params (pretrained from Qwen3-TTS). Only
+    # `backbone_to_talker_proj` and the rest of OmniVoice update in that case.
+    freeze_predictor: bool = False
 
     # Init settings
     resume_from_checkpoint: Optional[str] = None
