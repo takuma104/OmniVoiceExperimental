@@ -71,6 +71,10 @@ from omnivoice.utils.voice_design import (
 )
 
 from qwen_tts import Qwen3TTSTokenizer
+from qwen_tts.core.models.configuration_qwen3_tts import Qwen3TTSConfig
+from qwen_tts.core.models.modeling_qwen3_tts import (
+    Qwen3TTSTalkerCodePredictorModelForConditionalGeneration,
+)
 from qwen_tts.core.tokenizer_12hz.modeling_qwen3_tts_tokenizer_v2 import Qwen3TTSTokenizerV2EncoderOutput
 
 logger = logging.getLogger(__name__)
@@ -165,6 +169,8 @@ class OmniVoiceConfig(PretrainedConfig):
         num_audio_codebook: int = 16,
         audio_codebook_weights: Optional[list[float]] = None,
         llm_config: Optional[Union[dict, PretrainedConfig]] = None,
+        use_predictor: bool = False,
+        predictor_pretrained_path: Optional[str] = None,
         **kwargs,
     ):
 
@@ -180,6 +186,8 @@ class OmniVoiceConfig(PretrainedConfig):
         if audio_codebook_weights is None:
             audio_codebook_weights = [24, 20, 16, 12, 8, 8, 6, 6, 4, 4, 4, 4, 2, 2, 2, 2]
         self.audio_codebook_weights = audio_codebook_weights
+        self.use_predictor = use_predictor
+        self.predictor_pretrained_path = predictor_pretrained_path
 
 
 class OmniVoice(PreTrainedModel):
@@ -207,11 +215,20 @@ class OmniVoice(PreTrainedModel):
             torch.arange(config.num_audio_codebook) * config.audio_vocab_size,
         )
 
-        self.audio_heads = nn.Linear(
-            self.config.llm_config.hidden_size,
-            config.num_audio_codebook * config.audio_vocab_size,
-            bias=False,
-        )
+        if config.use_predictor:
+            # cb0-only head; cb1..15 predicted by Qwen3TTSTalkerCodePredictor
+            self.audio_heads = nn.Linear(
+                self.config.llm_config.hidden_size,
+                config.audio_vocab_size,
+                bias=False,
+            )
+            self._init_predictor()
+        else:
+            self.audio_heads = nn.Linear(
+                self.config.llm_config.hidden_size,
+                config.num_audio_codebook * config.audio_vocab_size,
+                bias=False,
+            )
 
         self.normalized_audio_codebook_weights = [
             w / sum(config.audio_codebook_weights)
@@ -226,6 +243,65 @@ class OmniVoice(PreTrainedModel):
         self.duration_estimator = None
         self.sampling_rate = None
         self._asr_pipe = None
+
+    def _init_predictor(self) -> None:
+        """Instantiate Qwen3TTSTalkerCodePredictor and the backbone→talker projection.
+
+        Predictor pretrained weights live under the `talker.code_predictor.*` keys
+        of the full Qwen3-TTS checkpoint. We load the full qwen_tts model once,
+        lift out the `code_predictor` submodule, and copy its state_dict into our
+        freshly-built predictor.
+        """
+        path = self.config.predictor_pretrained_path
+        if path is None:
+            path = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
+
+        qwen_cfg = Qwen3TTSConfig.from_pretrained(path)
+        pred_cfg = qwen_cfg.talker_config.code_predictor_config
+        talker_cfg = qwen_cfg.talker_config  # has hidden_size=2048
+
+        self.predictor = Qwen3TTSTalkerCodePredictorModelForConditionalGeneration(
+            pred_cfg, talker_cfg
+        )
+        # backbone LLM hidden → talker hidden (usually 1024 → 2048).
+        # Predictor's internal `small_to_mtp_projection` further maps 2048 → pred_hidden.
+        self.backbone_to_talker_proj = nn.Linear(
+            self.config.llm_config.hidden_size,
+            talker_cfg.hidden_size,
+        )
+        self._num_predicted_codebooks = pred_cfg.num_code_groups - 1  # 15
+
+    def _load_predictor_pretrained(self) -> None:
+        """Load pretrained Predictor weights from the Qwen3-TTS full checkpoint.
+
+        Separated from `_init_predictor` so from_pretrained can skip this step
+        when resuming from an OmniVoice checkpoint that already has Predictor
+        weights in its state_dict.
+        """
+        if not getattr(self.config, "use_predictor", False):
+            return
+        path = self.config.predictor_pretrained_path
+        if path is None:
+            path = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
+
+        # Import lazily to avoid a heavy import at module load time.
+        from qwen_tts import Qwen3TTSModel
+
+        logger.info("Loading Qwen3-TTS Predictor pretrained weights from %s", path)
+        tmp = Qwen3TTSModel.from_pretrained(path, dtype=torch.float32, device_map="cpu")
+        sd = {k: v.to(torch.float32) for k, v in tmp.model.talker.code_predictor.state_dict().items()}
+        missing, unexpected = self.predictor.load_state_dict(sd, strict=False)
+        self.predictor.to(torch.float32)
+        logger.info(
+            "Predictor weights loaded. missing=%d unexpected=%d",
+            len(missing),
+            len(unexpected),
+        )
+        if missing:
+            logger.info("missing keys (sample): %s", missing[:5])
+        if unexpected:
+            logger.info("unexpected keys (sample): %s", unexpected[:5])
+        del tmp
 
     @property
     def audio_frame_rate(self) -> float:
@@ -397,6 +473,14 @@ class OmniVoice(PreTrainedModel):
         )
         hidden_states = llm_outputs[0]
 
+        if self.config.use_predictor:
+            return self._forward_with_predictor(
+                hidden_states=hidden_states,
+                input_ids=input_ids,
+                audio_mask=audio_mask,
+                labels=labels,
+            )
+
         loss = None
 
         # Shape: [B, S, C * Vocab]
@@ -438,6 +522,83 @@ class OmniVoice(PreTrainedModel):
             loss=loss,
             logits=audio_logits,
         )
+
+    def _forward_with_predictor(
+        self,
+        hidden_states: torch.Tensor,
+        input_ids: torch.LongTensor,
+        audio_mask: torch.Tensor,
+        labels: Optional[torch.LongTensor],
+    ):
+        """Cascaded head path: backbone predicts cb0, Predictor predicts cb1..15.
+
+        Shapes: hidden_states [B,S,H_llm], input_ids/labels [B,C,S], audio_mask [B,S].
+        Returns logits [B,1,S,V] (cb0 only) for iterative decoding.
+        """
+        cb0_logits = self.audio_heads(hidden_states)  # [B, S, V]
+        # Expose as [B, 1, S, V] so iterative decoding code shares the same layout.
+        audio_logits = cb0_logits.unsqueeze(1)
+
+        if labels is None:
+            return OmniVoiceModelOutput(loss=None, logits=audio_logits)
+
+        # --- cb0 loss (backbone head) --------------------------------------
+        cb0_labels = labels[:, 0, :]  # [B, S]
+        cb0_per_token = F.cross_entropy(
+            cb0_logits.permute(0, 2, 1),  # [B, V, S]
+            cb0_labels,
+            reduction="none",
+            ignore_index=-100,
+        )  # [B, S]
+        cb0_valid = (cb0_labels != -100).float()
+        cb0_loss_mean = (cb0_per_token * cb0_valid).sum() / cb0_valid.sum().clamp(min=1.0)
+
+        # --- Predictor path for cb1..15 ------------------------------------
+        # Clean (pre-mask) codec tokens: labels where !=-100 else input_ids.
+        # At audio positions: labels!=-100 at masked positions (→ original tokens),
+        # labels==-100 at unmasked/prompt positions (→ input_ids already holds the original).
+        clean_tokens = torch.where(labels != -100, labels, input_ids)  # [B, C, S]
+        clean_bsc = clean_tokens.permute(0, 2, 1)  # [B, S, C]
+        labels_bsc = labels.permute(0, 2, 1)  # [B, S, C]
+
+        # Flatten to per-frame over the audio mask.
+        talker_hidden_flat = hidden_states[audio_mask]  # [N, H_llm]
+        clean_flat = clean_bsc[audio_mask]  # [N, C]
+        pred_labels = labels_bsc[audio_mask][:, 1:]  # [N, C-1]
+
+        talker_projected = self.backbone_to_talker_proj(talker_hidden_flat)  # [N, H_talker]
+
+        # Predictor input sequence: [talker_hidden, emb(cb0), ..., emb(cb14)] → length C (=16).
+        num_pred = self._num_predicted_codebooks  # 15 = C - 1
+        codec_embs = []
+        for i in range(num_pred):
+            codec_embs.append(
+                self.predictor.model.codec_embedding[i](clean_flat[:, i])
+            )
+        pred_inputs = torch.stack(
+            [talker_projected, *codec_embs], dim=1
+        )  # [N, 16, H_talker]
+
+        pred_out = self.predictor.forward_finetune(inputs_embeds=pred_inputs)
+        pred_logits = pred_out.logits  # [N, 15, V_pred]
+
+        per_token_loss = F.cross_entropy(
+            pred_logits.permute(0, 2, 1),  # [N, V_pred, 15]
+            pred_labels,
+            reduction="none",
+            ignore_index=-100,
+        )  # [N, 15]
+        valid_mask = (pred_labels != -100).float()
+        layer_means_1_15 = (per_token_loss * valid_mask).sum(dim=0) / valid_mask.sum(
+            dim=0
+        ).clamp(min=1.0)  # [15]
+
+        weights = torch.tensor(
+            self.normalized_audio_codebook_weights, device=hidden_states.device
+        )
+        loss = cb0_loss_mean * weights[0] + (layer_means_1_15 * weights[1:]).sum()
+
+        return OmniVoiceModelOutput(loss=loss, logits=audio_logits)
 
     def supported_language_ids(self) -> set[str]:
         """Return a list of supported language IDs."""
@@ -1196,6 +1357,11 @@ class OmniVoice(PreTrainedModel):
             device=self.device,
         )
 
+        use_predictor = getattr(self.config, "use_predictor", False)
+        # When Predictor is active the backbone only unmasks cb0 in the iterative loop;
+        # cb1..15 are filled in a single Predictor pass after the loop.
+        sched_cb_count = 1 if use_predictor else self.config.num_audio_codebook
+
         timesteps = _get_time_steps(
             t_start=0.0,
             t_end=1.0,
@@ -1204,7 +1370,7 @@ class OmniVoice(PreTrainedModel):
         ).tolist()
         schedules = []
         for t_len in task.target_lens:
-            total_mask = t_len * self.config.num_audio_codebook
+            total_mask = t_len * sched_cb_count
             rem = total_mask
             sched = []
             for step in range(gen_config.num_step):
@@ -1220,19 +1386,29 @@ class OmniVoice(PreTrainedModel):
                 rem -= int(num)
             schedules.append(sched)
 
-        # Codebook layer penalty:
-        # A layer ID matrix for adding penalties to logits so that smaller values are unmasked first. 
-        # Set the layer penalty in the importance order of `audio_codebook_weights`.
-        layer_penalty = torch.tensor([6, 0, 1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15], 
-                                 device=self.device).view(1, -1, 1)
-        assert layer_penalty.shape[1] == self.config.num_audio_codebook
+        if use_predictor:
+            # Only cb0 is scheduled; layer penalty is not meaningful (C=1).
+            layer_penalty = torch.zeros(1, 1, 1, device=self.device, dtype=torch.long)
+            layer_penalty_factor = 0.0
+        else:
+            # Codebook layer penalty:
+            # A layer ID matrix for adding penalties to logits so that smaller values are unmasked first.
+            # Set the layer penalty in the importance order of `audio_codebook_weights`.
+            layer_penalty = torch.tensor(
+                [6, 0, 1, 2, 3, 4, 5, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+                device=self.device,
+            ).view(1, -1, 1)
+            assert layer_penalty.shape[1] == self.config.num_audio_codebook
+            layer_penalty_factor = gen_config.layer_penalty_factor
 
+        last_hidden_states = None
         for step in range(gen_config.num_step):
-            batch_logits = self(
+            outputs = self(
                 input_ids=batch_input_ids,
                 audio_mask=batch_audio_mask,
                 attention_mask=batch_attention_mask,
-            ).logits.to(torch.float32)
+            )
+            batch_logits = outputs.logits.to(torch.float32)
 
             for i in range(B):
                 k = schedules[i][step]
@@ -1241,24 +1417,27 @@ class OmniVoice(PreTrainedModel):
 
                 c_len, t_len = c_lens[i], task.target_lens[i]
 
-                # Extract real target Logits
-                # [1, C, T, V]
+                # Extract real target logits
+                # [1, C_sched, T, V] (C_sched = 1 if use_predictor else 16)
                 c_logits = batch_logits[i : i + 1, :, c_len - t_len : c_len, :]
                 if gen_config.guidance_scale != 0:
                     u_logits = batch_logits[B + i : B + i + 1, :, :t_len, :]
 
                 pred_tokens, scores = self._predict_tokens_with_scoring(
-                    c_logits, 
-                    u_logits if gen_config.guidance_scale != 0 else None, 
-                    gen_config
+                    c_logits,
+                    u_logits if gen_config.guidance_scale != 0 else None,
+                    gen_config,
                 )
 
-                scores = scores - (layer_penalty * gen_config.layer_penalty_factor)
+                scores = scores - (layer_penalty * layer_penalty_factor)
 
                 if gen_config.position_temperature != 0:
                     scores = _gumbel_sample(scores, gen_config.position_temperature)
 
-                sample_tokens = tokens[i : i + 1, :, :t_len]
+                if use_predictor:
+                    sample_tokens = tokens[i : i + 1, 0:1, :t_len]
+                else:
+                    sample_tokens = tokens[i : i + 1, :, :t_len]
                 scores.masked_fill_(
                     sample_tokens != self.config.audio_mask_id, -float("inf")
                 )
@@ -1268,13 +1447,92 @@ class OmniVoice(PreTrainedModel):
                 flat_tokens[topk_idx] = pred_tokens.flatten()[topk_idx]
                 sample_tokens.copy_(flat_tokens.view_as(sample_tokens))
 
-                # Update individual slices into batched structure
-                tokens[i : i + 1, :, :t_len] = sample_tokens
-                batch_input_ids[i : i + 1, :, c_len - t_len : c_len] = sample_tokens
-                if gen_config.guidance_scale != 0:
-                    batch_input_ids[B + i : B + i + 1, :, :t_len] = sample_tokens
+                if use_predictor:
+                    tokens[i : i + 1, 0:1, :t_len] = sample_tokens
+                    batch_input_ids[
+                        i : i + 1, 0:1, c_len - t_len : c_len
+                    ] = sample_tokens
+                    if gen_config.guidance_scale != 0:
+                        batch_input_ids[
+                            B + i : B + i + 1, 0:1, :t_len
+                        ] = sample_tokens
+                else:
+                    tokens[i : i + 1, :, :t_len] = sample_tokens
+                    batch_input_ids[
+                        i : i + 1, :, c_len - t_len : c_len
+                    ] = sample_tokens
+                    if gen_config.guidance_scale != 0:
+                        batch_input_ids[B + i : B + i + 1, :, :t_len] = sample_tokens
+
+        if use_predictor:
+            self._fill_cb1_to_15_with_predictor(
+                tokens=tokens,
+                batch_input_ids=batch_input_ids,
+                batch_audio_mask=batch_audio_mask,
+                batch_attention_mask=batch_attention_mask,
+                c_lens=c_lens,
+                task=task,
+                B=B,
+            )
 
         return [tokens[i, :, : task.target_lens[i]] for i in range(B)]
+
+    @torch.inference_mode()
+    def _fill_cb1_to_15_with_predictor(
+        self,
+        tokens: torch.Tensor,
+        batch_input_ids: torch.Tensor,
+        batch_audio_mask: torch.Tensor,
+        batch_attention_mask: torch.Tensor,
+        c_lens: List[int],
+        task: GenerationTask,
+        B: int,
+    ) -> None:
+        """After cb0 is fully decoded, run the Predictor once per target frame
+        (codebook-axis AR, 15 steps) to fill cb1..15 in-place in `tokens`.
+
+        Only the cond slice (batch index 0..B-1) of the backbone is consulted.
+        """
+        # Run a final forward on the cond slice to get hidden states aligned with
+        # the fully-unmasked cb0.
+        cond_input_ids = batch_input_ids[:B]
+        cond_audio_mask = batch_audio_mask[:B]
+        cond_attention_mask = batch_attention_mask[:B]
+
+        inputs_embeds = self._prepare_embed_inputs(cond_input_ids, cond_audio_mask)
+        llm_outputs = self.llm(
+            inputs_embeds=inputs_embeds,
+            attention_mask=cond_attention_mask,
+            return_dict=True,
+        )
+        hidden_states = llm_outputs[0]  # [B, S, H_llm]
+
+        for i in range(B):
+            c_len = c_lens[i]
+            t_len = task.target_lens[i]
+            # Target-region slice only (skip conditioning/prompt region).
+            h = hidden_states[i : i + 1, c_len - t_len : c_len, :]  # [1, T, H_llm]
+            cb0 = tokens[i : i + 1, 0, :t_len]  # [1, T]
+
+            talker = self.backbone_to_talker_proj(h.squeeze(0))  # [T, H_talker]
+            cb0_emb = self.predictor.model.codec_embedding[0](cb0.squeeze(0))  # [T, H_talker]
+
+            # Predictor input per frame: [talker_hidden, cb0_emb]; generate 15 more tokens
+            # along the codebook axis (one per cb1..15).
+            pred_inputs = torch.stack([talker, cb0_emb], dim=1)  # [T, 2, H_talker]
+
+            gen_out = self.predictor.generate(
+                inputs_embeds=pred_inputs,
+                max_new_tokens=self._num_predicted_codebooks,
+                do_sample=False,
+            )
+            # gen_out.sequences: [T, 15]
+            cb_1_15 = gen_out if isinstance(gen_out, torch.Tensor) else gen_out.sequences
+            # Trim any prefix tokens the GenerationMixin might prepend (generate returns
+            # only the new tokens when starting from inputs_embeds, but be defensive).
+            cb_1_15 = cb_1_15[:, -self._num_predicted_codebooks :]
+
+            tokens[i : i + 1, 1:, :t_len] = cb_1_15.T.unsqueeze(0)  # [1, 15, T]
 
     def _predict_tokens_with_scoring(self, c_logits, u_logits, gen_config):
         if gen_config.guidance_scale != 0:

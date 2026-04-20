@@ -93,6 +93,8 @@ def build_model_and_tokenizer(
             num_audio_codebook=config.num_audio_codebook,
             audio_codebook_weights=config.audio_codebook_weights,
             llm_config=llm_config,
+            use_predictor=config.use_predictor,
+            predictor_pretrained_path=config.predictor_pretrained_path,
         )
 
         original_level = hf_logging.get_verbosity()
@@ -106,6 +108,10 @@ def build_model_and_tokenizer(
 
         hf_logging.set_verbosity(original_level)
         model = OmniVoice(config=ov_config, llm=llm)
+
+        if config.use_predictor:
+            # Fresh init: overlay Qwen3TTS pretrained Predictor weights.
+            model._load_predictor_pretrained()
 
     # 3. Resize Embeddings
     if len(tokenizer) != model.config.llm_config.vocab_size:
@@ -137,6 +143,7 @@ def build_dataloaders(
         use_pinyin_ratio=config.use_pinyin_ratio,
         instruct_ratio=config.instruct_ratio,
         only_instruct_ratio=config.only_instruct_ratio,
+        predictor_mode=config.use_predictor,
     )
 
     train_manifests, dev_manifests = prepare_data_manifests_from_json(

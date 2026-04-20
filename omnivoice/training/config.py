@@ -51,6 +51,10 @@ class TrainingConfig:
     instruct_ratio: float = 1.0
     only_instruct_ratio: float = 0.5
 
+    # Cascaded Predictor (Qwen3TTSTalkerCodePredictor for cb1..C-1)
+    use_predictor: bool = False
+    predictor_pretrained_path: Optional[str] = None  # e.g. "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
+
     # Init settings
     resume_from_checkpoint: Optional[str] = None
     init_from_checkpoint: Optional[str] = None
