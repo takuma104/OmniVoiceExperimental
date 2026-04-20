@@ -29,9 +29,13 @@ def main():
         use_predictor=True,
         predictor_pretrained_path="Qwen/Qwen3-TTS-12Hz-1.7B-Base",
     )
+    import os
+    target_dtype = torch.bfloat16 if os.environ.get("BF16") == "1" else torch.float32
+    print(f"target_dtype = {target_dtype}")
+
     model = OmniVoice(config=ov_config)
-    model._load_predictor_pretrained()
-    model = model.to(torch.float32)
+    model._load_predictor_pretrained(dtype=target_dtype)
+    model = model.to(target_dtype)
     model.train()
 
     print("audio_heads params:", sum(p.numel() for p in model.audio_heads.parameters()))

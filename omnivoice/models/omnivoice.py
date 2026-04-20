@@ -271,7 +271,7 @@ class OmniVoice(PreTrainedModel):
         )
         self._num_predicted_codebooks = pred_cfg.num_code_groups - 1  # 15
 
-    def _load_predictor_pretrained(self) -> None:
+    def _load_predictor_pretrained(self, dtype: torch.dtype = torch.float32) -> None:
         """Load pretrained Predictor weights from the Qwen3-TTS full checkpoint.
 
         Separated from `_init_predictor` so from_pretrained can skip this step
@@ -287,11 +287,11 @@ class OmniVoice(PreTrainedModel):
         # Import lazily to avoid a heavy import at module load time.
         from qwen_tts import Qwen3TTSModel
 
-        logger.info("Loading Qwen3-TTS Predictor pretrained weights from %s", path)
-        tmp = Qwen3TTSModel.from_pretrained(path, dtype=torch.float32, device_map="cpu")
-        sd = {k: v.to(torch.float32) for k, v in tmp.model.talker.code_predictor.state_dict().items()}
+        logger.info("Loading Qwen3-TTS Predictor pretrained weights from %s (dtype=%s)", path, dtype)
+        tmp = Qwen3TTSModel.from_pretrained(path, dtype=dtype, device_map="cpu")
+        sd = {k: v.to(dtype) for k, v in tmp.model.talker.code_predictor.state_dict().items()}
         missing, unexpected = self.predictor.load_state_dict(sd, strict=False)
-        self.predictor.to(torch.float32)
+        self.predictor.to(dtype)
         logger.info(
             "Predictor weights loaded. missing=%d unexpected=%d",
             len(missing),

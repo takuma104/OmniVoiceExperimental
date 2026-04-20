@@ -77,6 +77,11 @@ class TrainingConfig:
 
     # System
     mixed_precision: str = "bf16"
+    # Parameter storage dtype. "fp32" keeps master weights in fp32 and relies
+    # on `mixed_precision` autocast for bf16 compute. "bf16"/"fp16" casts all
+    # params (LLM + audio heads + Predictor) to that dtype — saves VRAM but
+    # drops fp32 master weights, so optimizer numerics degrade.
+    param_dtype: str = "fp32"
     allow_tf32: bool = True
     use_deepspeed: bool = False
     deepspeed_config: Optional[str] = None

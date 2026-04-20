@@ -46,6 +46,26 @@ from omnivoice.training.config import TrainingConfig
 logger = logging.getLogger(__name__)
 
 
+_PARAM_DTYPE_MAP = {
+    "fp32": torch.float32,
+    "float32": torch.float32,
+    "bf16": torch.bfloat16,
+    "bfloat16": torch.bfloat16,
+    "fp16": torch.float16,
+    "float16": torch.float16,
+    "half": torch.float16,
+}
+
+
+def _resolve_param_dtype(name: str) -> torch.dtype:
+    key = name.lower() if isinstance(name, str) else "fp32"
+    if key not in _PARAM_DTYPE_MAP:
+        raise ValueError(
+            f"Unknown param_dtype={name!r}. Expected one of {sorted(_PARAM_DTYPE_MAP)}."
+        )
+    return _PARAM_DTYPE_MAP[key]
+
+
 def build_model_and_tokenizer(
     config: TrainingConfig,
 ) -> Tuple[OmniVoice, AutoTokenizer]:
@@ -76,12 +96,14 @@ def build_model_and_tokenizer(
     if tokens_to_add:
         tokenizer.add_special_tokens({"additional_special_tokens": tokens_to_add})
 
+    param_dtype = _resolve_param_dtype(config.param_dtype)
+
     if config.init_from_checkpoint:
         logger.info(f"Loading weights from {config.init_from_checkpoint}")
         model = OmniVoice.from_pretrained(
             config.init_from_checkpoint,
             attn_implementation="flex_attention",
-            dtype=torch.float32,
+            dtype=param_dtype,
             train=True,
         )
     else:
@@ -103,7 +125,7 @@ def build_model_and_tokenizer(
         llm = AutoModel.from_pretrained(
             config.llm_name_or_path,
             attn_implementation="flex_attention",
-            dtype=torch.float32,
+            dtype=param_dtype,
         )
 
         hf_logging.set_verbosity(original_level)
@@ -111,7 +133,11 @@ def build_model_and_tokenizer(
 
         if config.use_predictor:
             # Fresh init: overlay Qwen3TTS pretrained Predictor weights.
-            model._load_predictor_pretrained()
+            model._load_predictor_pretrained(dtype=param_dtype)
+
+        # Cast custom modules (audio_embeddings, audio_heads, backbone_to_talker_proj)
+        # to the target dtype. LLM and Predictor are already loaded at param_dtype.
+        model.to(param_dtype)
 
     # 3. Resize Embeddings
     if len(tokenizer) != model.config.llm_config.vocab_size:
