@@ -260,6 +260,11 @@ class OmniVoice(PreTrainedModel):
         pred_cfg = qwen_cfg.talker_config.code_predictor_config
         talker_cfg = qwen_cfg.talker_config  # has hidden_size=2048
 
+        # Match the backbone LLM's fast-attention tier. Qwen3TTSPreTrainedModel
+        # does not advertise flex_attention support, so flash_attention_2 is the
+        # fastest implementation we can request here; default would be sdpa.
+        pred_cfg._attn_implementation = "flash_attention_2"
+
         self.predictor = Qwen3TTSTalkerCodePredictorModelForConditionalGeneration(
             pred_cfg, talker_cfg
         )
