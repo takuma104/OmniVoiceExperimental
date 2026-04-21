@@ -44,6 +44,8 @@ dependencies = [
     "wandb>=0.25.1",
     "ipykernel>=7.2.0",
     "iprogress>=0.4",
+    "datasets>=4.8.4",
+    "torchcodec>=0.7,<0.8",
 ]
 
 [project.optional-dependencies]

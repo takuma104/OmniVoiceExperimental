@@ -18,7 +18,7 @@
 """
 Extract audio tokens from audio data and pack them into WebDataset shards.
 
-Supports two input modes:
+Supports three input modes:
 
 1. WebDataset manifest (data.lst):
     python extract_audio_tokens.py \
@@ -29,6 +29,15 @@ Supports two input modes:
 2. Raw JSONL (each line: {"id": "...", "audio_path": "...", "text": "...", ...}):
     python extract_audio_tokens.py \
         --input_jsonl data.jsonl \
+        --tar_output_pattern output/audios/shard-%06d.tar \
+        --jsonl_output_pattern output/txts/shard-%06d.jsonl
+
+3. HuggingFace Dataset:
+    python extract_audio_tokens.py \
+        --dataset_name amphion/Emilia-Dataset \
+        --data_files "Emilia/EN/*.tar" \
+        --split en \
+        --streaming True \
         --tar_output_pattern output/audios/shard-%06d.tar \
         --jsonl_output_pattern output/txts/shard-%06d.jsonl
 
@@ -57,12 +66,19 @@ from typing import Any
 
 import numpy as np
 import torch
+import torchaudio
 import webdataset as wds
+from datasets import load_dataset
 from torch.utils.data import DataLoader, IterableDataset
+from torch.utils.data import get_worker_info
 from tqdm.auto import tqdm
 from transformers import AutoFeatureExtractor, HiggsAudioV2TokenizerModel
 
-from omnivoice.data.dataset import JsonlDatasetReader, WebDatasetReader
+from omnivoice.data.dataset import (
+    JsonlDatasetReader,
+    WebDatasetReader,
+    load_audio_webdataset,
+)
 from omnivoice.utils.common import str2bool
 
 warnings.filterwarnings(
@@ -88,6 +104,39 @@ def build_parser() -> argparse.ArgumentParser:
         "--input_jsonl",
         default=None,
         help="Path to raw JSONL file (alternative to --input_manifest).",
+    )
+    parser.add_argument(
+        "--dataset_name",
+        default=None,
+        help="HuggingFace dataset name or path "
+        '(e.g. "amphion/Emilia-Dataset").',
+    )
+    parser.add_argument(
+        "--data_files",
+        default=None,
+        help="Data file pattern or JSON dict for load_dataset "
+        '(e.g. "Emilia/EN/*.tar").',
+    )
+    parser.add_argument(
+        "--split",
+        default=None,
+        help='Dataset split name for HuggingFace input (e.g. "en", "train").',
+    )
+    parser.add_argument(
+        "--streaming",
+        type=str2bool,
+        default=True,
+        help="Use HuggingFace streaming mode.",
+    )
+    parser.add_argument(
+        "--hf_cache_dir",
+        default=None,
+        help="HuggingFace cache directory.",
+    )
+    parser.add_argument(
+        "--hf_token",
+        default=None,
+        help="HuggingFace token for gated datasets.",
     )
     parser.add_argument(
         "--tar_output_pattern",
@@ -169,6 +218,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=42,
         help="Random seed for shuffle (default: 42).",
+    )
+    parser.add_argument(
+        "--shuffle-buffer-size",
+        type=int,
+        default=10_000,
+        help="Buffer size for HuggingFace streaming shuffle (default: 10000).",
     )
     return parser
 
@@ -287,6 +342,143 @@ def _encode_metadata(metadata: dict[str, Any]) -> bytes:
     return json.dumps(cleaned, ensure_ascii=False).encode("utf-8")
 
 
+class HFDatasetAdapter(IterableDataset):
+    """Convert HuggingFace samples to the internal audio tokenization format."""
+
+    def __init__(
+        self,
+        hf_dataset,
+        sample_rate: int = HIGGS_INPUT_SAMPLE_RATE,
+        normalize_audio: bool = True,
+        num_machines: int = 1,
+        machine_index: int = 0,
+    ):
+        self.hf_dataset = hf_dataset
+        self.sample_rate = sample_rate
+        self.normalize_audio = normalize_audio
+        self.num_machines = num_machines
+        self.machine_index = machine_index
+
+    def __iter__(self):
+        worker_info = get_worker_info()
+        worker_id = worker_info.id if worker_info is not None else 0
+        num_workers = worker_info.num_workers if worker_info is not None else 1
+        machine_local_idx = 0
+
+        for global_idx, sample in enumerate(self.hf_dataset):
+            if (
+                self.num_machines > 1
+                and global_idx % self.num_machines != self.machine_index
+            ):
+                continue
+            if num_workers > 1 and machine_local_idx % num_workers != worker_id:
+                machine_local_idx += 1
+                continue
+            machine_local_idx += 1
+            converted = self._convert_sample(sample)
+            if converted is not None:
+                yield converted
+
+    def _convert_sample(self, sample: dict[str, Any]) -> dict[str, Any] | None:
+        """Convert an HF dataset sample to {"audio": Tensor, "label": dict}."""
+        try:
+            waveform = self._decode_audio(sample)
+            if waveform is None:
+                return None
+
+            if waveform.ndim == 1:
+                waveform = waveform.unsqueeze(0)
+            if waveform.shape[0] > 1:
+                waveform = waveform.mean(dim=0, keepdim=True)
+
+            if self.normalize_audio:
+                waveform = (waveform / (waveform.abs().max() + 1e-7)) * 0.9
+
+            json_meta = sample.get("json")
+            if isinstance(json_meta, bytes):
+                json_meta = json.loads(json_meta.decode("utf-8"))
+            elif isinstance(json_meta, str):
+                json_meta = json.loads(json_meta)
+            elif json_meta is None:
+                json_meta = {}
+
+            def get_field(key: str, *fallbacks: str) -> Any:
+                for field in (key, *fallbacks):
+                    value = sample.get(field)
+                    if value is not None:
+                        return value
+                    value = json_meta.get(field)
+                    if value is not None:
+                        return value
+                return None
+
+            sample_id = get_field("id", "__key__") or "unknown"
+            audio_duration = waveform.shape[1] / self.sample_rate
+            label = {
+                "id": sample_id,
+                "text": get_field("text"),
+                "language_id": get_field("language_id", "language"),
+                "audio_duration": audio_duration,
+                "speaker": get_field("speaker"),
+                "dnsmos": get_field("dnsmos"),
+            }
+
+            ignored_keys = {"wav", "mp3", "flac", "ogg", "audio", "__key__", "__url__"}
+            for key, value in json_meta.items():
+                if key not in label and key not in ignored_keys:
+                    label[key] = value
+
+            return {"audio": waveform, "label": label}
+
+        except Exception as exc:
+            sample_id = sample.get("id") or sample.get("__key__", "unknown")
+            logging.warning(f"Failed to convert HF sample {sample_id}: {exc}")
+            return None
+
+    def _decode_audio(self, sample: dict[str, Any]) -> torch.Tensor | None:
+        """Decode audio from common HF Dataset and WebDataset-style records."""
+        for audio_key in ("mp3", "flac", "wav", "ogg"):
+            audio_value = sample.get(audio_key)
+            if audio_value is None:
+                continue
+            if isinstance(audio_value, bytes):
+                return load_audio_webdataset(audio_value, sample_rate=self.sample_rate)
+            if hasattr(audio_value, "get_all_samples"):
+                return self._audio_decoder_to_tensor(audio_value)
+
+        audio_info = sample.get("audio")
+        if isinstance(audio_info, dict):
+            if "array" in audio_info and audio_info["array"] is not None:
+                waveform = torch.tensor(audio_info["array"], dtype=torch.float32)
+                if waveform.ndim == 1:
+                    waveform = waveform.unsqueeze(0)
+                sr = audio_info.get("sampling_rate", self.sample_rate)
+                return self._maybe_resample(waveform, sr)
+            if "bytes" in audio_info and audio_info["bytes"] is not None:
+                return load_audio_webdataset(
+                    audio_info["bytes"], sample_rate=self.sample_rate
+                )
+            if "path" in audio_info and audio_info["path"] is not None:
+                waveform, sr = torchaudio.load(audio_info["path"])
+                return self._maybe_resample(waveform, sr)
+
+        if hasattr(audio_info, "get_all_samples"):
+            return self._audio_decoder_to_tensor(audio_info)
+
+        logging.warning(f"No decodable audio found in sample {sample.get('id', '?')}")
+        return None
+
+    def _audio_decoder_to_tensor(self, audio_decoder) -> torch.Tensor:
+        audio_samples = audio_decoder.get_all_samples()
+        waveform = audio_samples.data
+        return self._maybe_resample(waveform, audio_samples.sample_rate)
+
+    def _maybe_resample(self, waveform: torch.Tensor, sr: int) -> torch.Tensor:
+        if sr != self.sample_rate:
+            waveform = torchaudio.functional.resample(waveform, sr, self.sample_rate)
+        return waveform
+
+
 class StreamingLengthFilteredDataset(IterableDataset):
     def __init__(
         self,
@@ -327,9 +519,16 @@ def main() -> None:
     mp.set_start_method("spawn", force=True)
 
     # Validate input arguments
-    assert bool(args.input_manifest) != bool(
-        args.input_jsonl
-    ), "Exactly one of --input_manifest or --input_jsonl must be provided."
+    input_modes = [
+        bool(args.input_manifest),
+        bool(args.input_jsonl),
+        bool(args.dataset_name),
+    ]
+    assert (
+        sum(input_modes) == 1
+    ), "Exactly one of --input_manifest, --input_jsonl, or --dataset_name must be provided."
+    if args.dataset_name:
+        assert args.split, "--split must be provided when using --dataset_name."
 
     if args.num_machines > 1:
         assert (
@@ -347,7 +546,7 @@ def main() -> None:
             shuffle_seed=args.shuffle_seed,
         )
         loader_workers = args.loader_workers
-    else:
+    elif args.input_manifest:
         logging.info(f"Input mode: WebDataset manifest ({args.input_manifest})")
         manifest_num_lines = count_lines(args.input_manifest)
         loader_workers = min(args.loader_workers, manifest_num_lines)
@@ -387,10 +586,78 @@ def main() -> None:
             sample_rate=HIGGS_INPUT_SAMPLE_RATE,
             evaluation=True,
         )
+    else:
+        data_files = args.data_files
+        if data_files:
+            try:
+                data_files = json.loads(data_files)
+            except (json.JSONDecodeError, TypeError):
+                pass
+
+        logging.info(
+            f"Input mode: HuggingFace Dataset ({args.dataset_name}), "
+            f"data_files={data_files}, split={args.split}, streaming={args.streaming}"
+        )
+        load_kwargs: dict[str, Any] = {
+            "path": args.dataset_name,
+            "split": args.split,
+            "streaming": args.streaming,
+        }
+        if data_files is not None:
+            if isinstance(data_files, str):
+                load_kwargs["data_files"] = {args.split: data_files}
+            else:
+                load_kwargs["data_files"] = data_files
+        if args.hf_cache_dir:
+            load_kwargs["cache_dir"] = args.hf_cache_dir
+        if args.hf_token:
+            load_kwargs["token"] = args.hf_token
+
+        hf_dataset = load_dataset(**load_kwargs)
+        if args.shuffle:
+            if args.streaming:
+                hf_dataset = hf_dataset.shuffle(
+                    seed=args.shuffle_seed,
+                    buffer_size=args.shuffle_buffer_size,
+                )
+            else:
+                hf_dataset = hf_dataset.shuffle(seed=args.shuffle_seed)
+
+        total_samples = None
+        if not args.streaming:
+            total_samples = len(hf_dataset)
+        else:
+            try:
+                info = hf_dataset.info
+                if info and info.splits and args.split in info.splits:
+                    total_samples = info.splits[args.split].num_examples
+            except Exception:
+                pass
+        if total_samples is not None and args.num_machines > 1:
+            total_samples = (
+                total_samples + args.num_machines - 1 - args.machine_index
+            ) // args.num_machines
+
+        if total_samples is None:
+            logging.info(
+                "Total samples unknown for HuggingFace input; using indeterminate "
+                "progress bar"
+            )
+        else:
+            logging.info(f"Estimated total samples: {total_samples}")
+
+        base_dataset = HFDatasetAdapter(
+            hf_dataset,
+            sample_rate=HIGGS_INPUT_SAMPLE_RATE,
+            normalize_audio=True,
+            num_machines=args.num_machines,
+            machine_index=args.machine_index,
+        )
+        loader_workers = args.loader_workers
 
     # Adjust samples_per_shard if min_num_shards would be violated
     samples_per_shard = args.samples_per_shard
-    if total_samples > 0:
+    if total_samples is not None and total_samples > 0:
         estimated_shards = max(
             1, (total_samples + samples_per_shard - 1) // samples_per_shard
         )
@@ -465,26 +732,32 @@ def main() -> None:
     shard_idx = 0
     shard_sample_count = 0
     shard_duration = 0.0
-    shard_manifest = {}  # shard_idx -> (tar_path, jsonl_path, count, duration)
+    shard_manifest_count = 0
 
     tar_writer = None
     jsonl_file = None
+    manifest_file = open(manifest_path, "w", encoding="utf-8")
+
+    def append_shard_to_manifest(idx: int, sample_count: int, duration: float) -> None:
+        nonlocal shard_manifest_count
+        tar_path = os.path.abspath(tar_output_pattern % idx)
+        jsonl_path = os.path.abspath(jsonl_output_pattern % idx)
+        manifest_file.write(f"{tar_path} {jsonl_path} {sample_count} {duration:.3f}\n")
+        manifest_file.flush()
+        os.fsync(manifest_file.fileno())
+        shard_manifest_count += 1
 
     def open_new_shard():
         nonlocal tar_writer, jsonl_file, shard_idx, shard_sample_count, shard_duration
+        had_previous = tar_writer is not None
         if tar_writer is not None:
             tar_writer.close()
         if jsonl_file is not None:
             jsonl_file.close()
         # Record manifest for the previous shard
-        if shard_idx > 0 and shard_sample_count > 0:
+        if had_previous and shard_sample_count > 0:
             prev_idx = shard_idx - 1
-            shard_manifest[prev_idx] = (
-                os.path.abspath(tar_output_pattern % prev_idx),
-                os.path.abspath(jsonl_output_pattern % prev_idx),
-                shard_sample_count,
-                shard_duration,
-            )
+            append_shard_to_manifest(prev_idx, shard_sample_count, shard_duration)
         tar_fname = tar_output_pattern % shard_idx
         jsonl_fname = jsonl_output_pattern % shard_idx
         tar_writer = wds.TarWriter(tar_fname)
@@ -588,27 +861,21 @@ def main() -> None:
         # Record the last shard in the manifest
         if shard_idx > 0 and shard_sample_count > 0:
             last_idx = shard_idx - 1
-            shard_manifest[last_idx] = (
-                os.path.abspath(tar_output_pattern % last_idx),
-                os.path.abspath(jsonl_output_pattern % last_idx),
-                shard_sample_count,
-                shard_duration,
-            )
-
-    # Write manifest file (data.lst)
-    with open(manifest_path, "w", encoding="utf-8") as mf:
-        for idx in sorted(shard_manifest.keys()):
-            tar_path, jsonl_path, count, duration = shard_manifest[idx]
-            mf.write(f"{tar_path} {jsonl_path} {count} {duration:.3f}\n")
+            append_shard_to_manifest(last_idx, shard_sample_count, shard_duration)
+        manifest_file.close()
 
     # Output final statistics
     total_failed = error_count + write_error_count
-    filtered_and_skipped = total_samples - processed_count - total_failed
+    filtered_and_skipped = (
+        total_samples - processed_count - total_failed
+        if total_samples is not None
+        else "unknown"
+    )
     logging.info(
         f"Processing Complete - Successful: {processed_count}, Failed: {total_failed}, "
         f"Filtered/Skipped: {filtered_and_skipped}, Shards written: {shard_idx}"
     )
-    logging.info(f"Manifest written to: {manifest_path} ({len(shard_manifest)} shards)")
+    logging.info(f"Manifest written to: {manifest_path} ({shard_manifest_count} shards)")
     if total_failed > 0:
         logging.info(f"Error details: {error_log_path}")
     if failed_ids and args.skip_errors:
