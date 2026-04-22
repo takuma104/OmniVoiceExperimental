@@ -70,11 +70,20 @@ warnings.filterwarnings(
 )
 
 HIGGS_INPUT_SAMPLE_RATE = 24_000
+XCODEC2_INPUT_SAMPLE_RATE = 16_000
+
+# Per-tokenizer expected number of codebooks (channels of `audio_codes`).
+_EXPECTED_NUM_CODEBOOKS = {
+    "higgs_v2": 8,
+    "xcodec2": 8,  # xcodec2 FSQ levels=[4]*8 → 8 virtual codebooks
+}
 
 
 # Global variables: Store tokenizer and device for each worker process
 worker_tokenizer = None
 worker_feature_extractor = None
+worker_tokenizer_type = "higgs_v2"
+worker_input_sample_rate = HIGGS_INPUT_SAMPLE_RATE
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -113,10 +122,20 @@ def build_parser() -> argparse.ArgumentParser:
         "shard count >= num_gpu * num_workers)",
     )
     parser.add_argument(
+        "--tokenizer_type",
+        type=str,
+        default="higgs_v2",
+        choices=["higgs_v2", "xcodec2"],
+        help="Audio tokenizer backend. higgs_v2=24kHz RVQ, "
+        "xcodec2=16kHz FSQ (8 virtual codebooks, cc-by-nc-4.0).",
+    )
+    parser.add_argument(
         "--tokenizer_path",
         type=str,
-        default="eustlb/higgs-audio-v2-tokenizer",
-        help="Path to audio tokenizer.",
+        default=None,
+        help="Path to audio tokenizer. Defaults: "
+        "eustlb/higgs-audio-v2-tokenizer for higgs_v2, "
+        "HKUST-Audio/xcodec2 for xcodec2.",
     )
     parser.add_argument(
         "--skip_errors", action="store_true", help="Skip items that fail to process"
@@ -184,12 +203,13 @@ def serialise_numpy(key: str, tokens: np.ndarray) -> dict:
     return {"__key__": key, "npy": buffer.getvalue()}
 
 
-def process_init(rank_queue, tokenizer_path):
+def process_init(rank_queue, tokenizer_path, tokenizer_type):
     """
     Initialization function for each worker process.
     Assigns a specific GPU to the process and loads the tokenizer.
     """
     global worker_tokenizer, worker_feature_extractor
+    global worker_tokenizer_type, worker_input_sample_rate
 
     # Configure worker process logging
     formatter = (
@@ -207,11 +227,22 @@ def process_init(rank_queue, tokenizer_path):
         worker_device = torch.device("cpu")
 
     logging.debug(f"Worker process initialized with device: {worker_device}")
-    # Load tokenizer onto the specified device
-    worker_feature_extractor = AutoFeatureExtractor.from_pretrained(tokenizer_path)
-    worker_tokenizer = HiggsAudioV2TokenizerModel.from_pretrained(
-        tokenizer_path, device_map=worker_device
-    )
+    worker_tokenizer_type = tokenizer_type
+
+    if tokenizer_type == "xcodec2":
+        from omnivoice.models.xcodec2_wrapper import XCodec2TokenizerModel
+
+        worker_feature_extractor = None
+        worker_tokenizer = XCodec2TokenizerModel.from_pretrained(
+            tokenizer_path, device_map=worker_device
+        )
+        worker_input_sample_rate = XCODEC2_INPUT_SAMPLE_RATE
+    else:
+        worker_feature_extractor = AutoFeatureExtractor.from_pretrained(tokenizer_path)
+        worker_tokenizer = HiggsAudioV2TokenizerModel.from_pretrained(
+            tokenizer_path, device_map=worker_device
+        )
+        worker_input_sample_rate = HIGGS_INPUT_SAMPLE_RATE
     logging.debug(f"Tokenizer loaded successfully on device {worker_device}")
 
 
@@ -227,17 +258,31 @@ def process_single_sample(sample: dict[str, Any]) -> dict[str, Any]:
 
         with torch.inference_mode():
             key = sample["label"]["id"]
-            inputs = worker_feature_extractor(
-                raw_audio=audio_tensor.squeeze(0).numpy(),
-                sampling_rate=HIGGS_INPUT_SAMPLE_RATE,
-                return_tensors="pt",
-            ).to(worker_tokenizer.device)
-            audio_tokens = worker_tokenizer.encode(
-                inputs["input_values"],
-            ).audio_codes.squeeze(0)
+            if worker_tokenizer_type == "xcodec2":
+                # xcodec2 expects raw 16 kHz waveform in (B, T). It runs
+                # Wav2Vec2-BERT + CodecEncoder + FSQ internally.
+                waveform = audio_tensor.to(worker_tokenizer.device)
+                if waveform.dim() == 1:
+                    waveform = waveform.unsqueeze(0)
+                audio_tokens = worker_tokenizer.encode(
+                    waveform
+                ).audio_codes.squeeze(0)
+            else:
+                inputs = worker_feature_extractor(
+                    raw_audio=audio_tensor.squeeze(0).numpy(),
+                    sampling_rate=worker_input_sample_rate,
+                    return_tensors="pt",
+                ).to(worker_tokenizer.device)
+                audio_tokens = worker_tokenizer.encode(
+                    inputs["input_values"],
+                ).audio_codes.squeeze(0)
 
             assert len(audio_tokens.shape) == 2
-            assert audio_tokens.size(0) == 8
+            expected_channels = _EXPECTED_NUM_CODEBOOKS[worker_tokenizer_type]
+            assert audio_tokens.size(0) == expected_channels, (
+                f"Expected {expected_channels} codebooks for {worker_tokenizer_type}, "
+                f"got {audio_tokens.size(0)}"
+            )
 
             num_tokens = audio_tokens.size(1)
             metadata = sample["label"]
@@ -336,13 +381,26 @@ def main() -> None:
             0 <= args.machine_index < args.num_machines
         ), f"machine_index {args.machine_index} must be in [0, {args.num_machines})"
 
+    # Resolve tokenizer path and per-tokenizer sample rate.
+    if args.tokenizer_path is None:
+        args.tokenizer_path = (
+            "HKUST-Audio/xcodec2"
+            if args.tokenizer_type == "xcodec2"
+            else "eustlb/higgs-audio-v2-tokenizer"
+        )
+    input_sample_rate = (
+        XCODEC2_INPUT_SAMPLE_RATE
+        if args.tokenizer_type == "xcodec2"
+        else HIGGS_INPUT_SAMPLE_RATE
+    )
+
     # Build base dataset and count total samples based on input mode
     if args.input_jsonl:
         logging.info(f"Input mode: raw JSONL ({args.input_jsonl})")
         total_samples = count_lines(args.input_jsonl)
         base_dataset = JsonlDatasetReader(
             args.input_jsonl,
-            sample_rate=HIGGS_INPUT_SAMPLE_RATE,
+            sample_rate=input_sample_rate,
             shuffle=args.shuffle,
             shuffle_seed=args.shuffle_seed,
         )
@@ -384,7 +442,7 @@ def main() -> None:
         )
         base_dataset = WebDatasetReader(
             manifests=manifests,
-            sample_rate=HIGGS_INPUT_SAMPLE_RATE,
+            sample_rate=input_sample_rate,
             evaluation=True,
         )
 
@@ -407,7 +465,7 @@ def main() -> None:
         base_iterable=base_dataset,
         min_len=args.min_length,
         max_len=args.max_length,
-        sr=HIGGS_INPUT_SAMPLE_RATE,
+        sr=input_sample_rate,
     )
     dataloader = DataLoader(
         dataset=filtered_dataset,
@@ -543,7 +601,7 @@ def main() -> None:
         with ProcessPoolExecutor(
             max_workers=num_processes,
             initializer=process_init,
-            initargs=(rank_queue, args.tokenizer_path),
+            initargs=(rank_queue, args.tokenizer_path, args.tokenizer_type),
         ) as executor:
             logging.info(f"Submitting tasks... ({num_processes} workers)")
             futures = set()

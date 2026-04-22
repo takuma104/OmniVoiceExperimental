@@ -27,7 +27,7 @@ Contains two processor classes:
 """
 
 import random
-from typing import Any, Dict
+from typing import Any, Dict, List, Union
 
 import torch
 
@@ -42,7 +42,7 @@ class OmniVoiceSampleProcessor:
         self,
         text_tokenizer: Any,
         num_channels: int,
-        audio_mask_id: int,
+        audio_mask_id: Union[int, List[int]],
         prompt_ratio_range: tuple,
         mask_ratio_range: tuple,
         drop_cond_ratio: float,
@@ -53,7 +53,19 @@ class OmniVoiceSampleProcessor:
     ):
         self.text_tokenizer = text_tokenizer
         self.num_channels = num_channels
-        self.audio_mask_id = audio_mask_id
+        # Support per-codebook mask IDs. Cache a (C, 1) tensor for broadcasting.
+        mask_ids_list = (
+            list(audio_mask_id)
+            if isinstance(audio_mask_id, list)
+            else [int(audio_mask_id)] * num_channels
+        )
+        if len(mask_ids_list) != num_channels:
+            raise ValueError(
+                f"len(audio_mask_id)={len(mask_ids_list)} does not match "
+                f"num_channels={num_channels}"
+            )
+        self.audio_mask_ids = mask_ids_list
+        self.audio_mask_ids_t = torch.tensor(mask_ids_list, dtype=torch.long).view(-1, 1)
         self.prompt_ratio_range = prompt_ratio_range
         self.mask_ratio_range = mask_ratio_range
         self.drop_cond_ratio = drop_cond_ratio
@@ -138,10 +150,13 @@ class OmniVoiceSampleProcessor:
         audio_inputs = audio_tokens.clone()
         audio_labels = audio_tokens.clone()
 
-        # Apply masking
+        # Apply masking (per-codebook mask IDs broadcast across time).
         maskable_region = audio_tokens[:, prompt_length:]
         token_mask = torch.rand(maskable_region.shape) < mask_ratio
-        audio_inputs[:, prompt_length:][token_mask] = self.audio_mask_id
+        mask_ids_bc = self.audio_mask_ids_t.expand_as(maskable_region)
+        audio_inputs[:, prompt_length:] = torch.where(
+            token_mask, mask_ids_bc, audio_inputs[:, prompt_length:]
+        )
         audio_labels[:, prompt_length:][
             ~token_mask
         ] = -100  # Only compute loss on masked tokens
@@ -186,14 +201,25 @@ class OmniVoiceSimpleSampleProcessor:
         self,
         text_tokenizer: Any,
         num_channels: int,
-        audio_mask_id: int,
+        audio_mask_id: Union[int, List[int]],
         prompt_ratio_range: tuple,
         mask_ratio_range: tuple,
         drop_cond_ratio: float,
     ):
         self.text_tokenizer = text_tokenizer
         self.num_channels = num_channels
-        self.audio_mask_id = audio_mask_id
+        mask_ids_list = (
+            list(audio_mask_id)
+            if isinstance(audio_mask_id, list)
+            else [int(audio_mask_id)] * num_channels
+        )
+        if len(mask_ids_list) != num_channels:
+            raise ValueError(
+                f"len(audio_mask_id)={len(mask_ids_list)} does not match "
+                f"num_channels={num_channels}"
+            )
+        self.audio_mask_ids = mask_ids_list
+        self.audio_mask_ids_t = torch.tensor(mask_ids_list, dtype=torch.long).view(-1, 1)
         self.prompt_ratio_range = prompt_ratio_range
         self.mask_ratio_range = mask_ratio_range
         self.drop_cond_ratio = drop_cond_ratio
@@ -222,10 +248,13 @@ class OmniVoiceSimpleSampleProcessor:
         audio_inputs = audio_tokens.clone()
         audio_labels = audio_tokens.clone()
 
-        # Apply masking
+        # Apply masking (per-codebook mask IDs broadcast across time).
         maskable_region = audio_tokens[:, prompt_length:]
         token_mask = torch.rand(maskable_region.shape) < mask_ratio
-        audio_inputs[:, prompt_length:][token_mask] = self.audio_mask_id
+        mask_ids_bc = self.audio_mask_ids_t.expand_as(maskable_region)
+        audio_inputs[:, prompt_length:] = torch.where(
+            token_mask, mask_ids_bc, audio_inputs[:, prompt_length:]
+        )
         audio_labels[:, prompt_length:][
             ~token_mask
         ] = -100  # Only compute loss on masked tokens

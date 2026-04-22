@@ -92,6 +92,7 @@ def build_model_and_tokenizer(
             audio_mask_id=config.audio_mask_id,
             num_audio_codebook=config.num_audio_codebook,
             audio_codebook_weights=config.audio_codebook_weights,
+            audio_tokenizer_type=config.audio_tokenizer_type,
             llm_config=llm_config,
         )
 

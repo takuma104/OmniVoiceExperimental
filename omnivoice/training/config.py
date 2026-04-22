@@ -24,7 +24,7 @@ in ``omnivoice.cli.train``.
 
 import json
 from dataclasses import asdict, dataclass, field
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Union
 
 
 @dataclass
@@ -35,9 +35,12 @@ class TrainingConfig:
 
     # Model Specific
     llm_name_or_path: str = "Qwen/Qwen3-0.6B"
-    audio_vocab_size: int = 1025  # valid vocab size + 1 (mask token)
-    audio_mask_id: int = 1024  # 1024 is the 1025-th token
+    # Scalar (uniform) or list (per-codebook). valid vocab size + 1 (mask token).
+    audio_vocab_size: Union[int, List[int]] = 1025
+    audio_mask_id: Union[int, List[int]] = 1024
     num_audio_codebook: int = 8
+    # "higgs_v2" (default) or "xcodec2" — selects the audio tokenizer backend.
+    audio_tokenizer_type: str = "higgs_v2"
 
     # Model Training Specific
     audio_codebook_weights: List[float | int] = field(

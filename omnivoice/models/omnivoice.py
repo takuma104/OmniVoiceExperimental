@@ -159,10 +159,11 @@ class OmniVoiceConfig(PretrainedConfig):
 
     def __init__(
         self,
-        audio_vocab_size: int = 1025,
-        audio_mask_id: int = 1024,
+        audio_vocab_size: Union[int, List[int]] = 1025,
+        audio_mask_id: Union[int, List[int]] = 1024,
         num_audio_codebook: int = 8,
         audio_codebook_weights: Optional[list[float]] = None,
+        audio_tokenizer_type: str = "higgs_v2",
         llm_config: Optional[Union[dict, PretrainedConfig]] = None,
         **kwargs,
     ):
@@ -173,12 +174,41 @@ class OmniVoiceConfig(PretrainedConfig):
         self.llm_config = llm_config
 
         super().__init__(**kwargs)
+        # Accept scalar (uniform vocab) or list (per-codebook vocab).
+        # We keep the public field names and add list-valued properties below.
+        if isinstance(audio_vocab_size, list):
+            if len(audio_vocab_size) != num_audio_codebook:
+                raise ValueError(
+                    f"len(audio_vocab_size)={len(audio_vocab_size)} does not match "
+                    f"num_audio_codebook={num_audio_codebook}"
+                )
+        if isinstance(audio_mask_id, list):
+            if len(audio_mask_id) != num_audio_codebook:
+                raise ValueError(
+                    f"len(audio_mask_id)={len(audio_mask_id)} does not match "
+                    f"num_audio_codebook={num_audio_codebook}"
+                )
         self.audio_vocab_size = audio_vocab_size
         self.audio_mask_id = audio_mask_id
         self.num_audio_codebook = num_audio_codebook
+        self.audio_tokenizer_type = audio_tokenizer_type
         if audio_codebook_weights is None:
             audio_codebook_weights = [8, 8, 6, 6, 4, 4, 2, 2]
         self.audio_codebook_weights = audio_codebook_weights
+
+    @property
+    def audio_vocab_sizes(self) -> List[int]:
+        v = self.audio_vocab_size
+        return list(v) if isinstance(v, list) else [int(v)] * self.num_audio_codebook
+
+    @property
+    def audio_mask_ids(self) -> List[int]:
+        m = self.audio_mask_id
+        return list(m) if isinstance(m, list) else [int(m)] * self.num_audio_codebook
+
+    @property
+    def is_uniform_vocab(self) -> bool:
+        return len(set(self.audio_vocab_sizes)) == 1
 
 
 class OmniVoice(PreTrainedModel):
@@ -197,18 +227,29 @@ class OmniVoice(PreTrainedModel):
             # Otherwise, initialize the LLM from the config.
             self.llm = AutoModel.from_config(self.config.llm_config)
 
+        vocab_sizes = config.audio_vocab_sizes
+        mask_ids = config.audio_mask_ids
+        total_vocab = sum(vocab_sizes)
+        offsets = [0]
+        for v in vocab_sizes[:-1]:
+            offsets.append(offsets[-1] + v)
+
         self.audio_embeddings = nn.Embedding(
-            config.num_audio_codebook * config.audio_vocab_size,
+            total_vocab,
             self.config.llm_config.hidden_size,
         )
         self.register_buffer(
             "codebook_layer_offsets",
-            torch.arange(config.num_audio_codebook) * config.audio_vocab_size,
+            torch.tensor(offsets, dtype=torch.long),
+        )
+        self.register_buffer(
+            "audio_mask_ids_t",
+            torch.tensor(mask_ids, dtype=torch.long),
         )
 
         self.audio_heads = nn.Linear(
             self.config.llm_config.hidden_size,
-            config.num_audio_codebook * config.audio_vocab_size,
+            total_vocab,
             bias=False,
         )
 
@@ -256,23 +297,41 @@ class OmniVoice(PreTrainedModel):
 
                 audio_tokenizer_path = os.path.join(resolved_path, "audio_tokenizer")
 
-                if not os.path.isdir(audio_tokenizer_path):
-                    # Fallback to the HuggingFace Hub path of transformers'
-                    # HiggsAudioV2Tokenizer if the local subdirectory doesn't exist.
-                    audio_tokenizer_path = "eustlb/higgs-audio-v2-tokenizer"
-
-                # higgs-audio-v2-tokenizer does not support MPS (output channels > 65536)
-                tokenizer_device = (
-                    "cpu" if str(model.device).startswith("mps") else model.device
-                )
-                model.audio_tokenizer = HiggsAudioV2TokenizerModel.from_pretrained(
-                    audio_tokenizer_path, device_map=tokenizer_device
-                )
-                model.feature_extractor = AutoFeatureExtractor.from_pretrained(
-                    audio_tokenizer_path
+                tokenizer_type = getattr(
+                    model.config, "audio_tokenizer_type", "higgs_v2"
                 )
 
-                model.sampling_rate = model.feature_extractor.sampling_rate
+                if tokenizer_type == "xcodec2":
+                    from omnivoice.models.xcodec2_wrapper import (
+                        XCodec2TokenizerModel,
+                    )
+
+                    if not os.path.isdir(audio_tokenizer_path):
+                        audio_tokenizer_path = "HKUST-Audio/xcodec2"
+
+                    tokenizer_device = model.device
+                    model.audio_tokenizer = XCodec2TokenizerModel.from_pretrained(
+                        audio_tokenizer_path, device_map=tokenizer_device
+                    )
+                    model.feature_extractor = None
+                    model.sampling_rate = model.audio_tokenizer.config.sampling_rate
+                else:
+                    if not os.path.isdir(audio_tokenizer_path):
+                        # Fallback to the HuggingFace Hub path of transformers'
+                        # HiggsAudioV2Tokenizer if the local subdirectory doesn't exist.
+                        audio_tokenizer_path = "eustlb/higgs-audio-v2-tokenizer"
+
+                    # higgs-audio-v2-tokenizer does not support MPS (output channels > 65536)
+                    tokenizer_device = (
+                        "cpu" if str(model.device).startswith("mps") else model.device
+                    )
+                    model.audio_tokenizer = HiggsAudioV2TokenizerModel.from_pretrained(
+                        audio_tokenizer_path, device_map=tokenizer_device
+                    )
+                    model.feature_extractor = AutoFeatureExtractor.from_pretrained(
+                        audio_tokenizer_path
+                    )
+                    model.sampling_rate = model.feature_extractor.sampling_rate
 
                 model.duration_estimator = RuleDurationEstimator()
 
@@ -402,16 +461,35 @@ class OmniVoice(PreTrainedModel):
 
         loss = None
 
-        # Shape: [B, S, C * Vocab]
+        # Shape: [B, S, sum(V_c)]
         batch_size, seq_len, _ = hidden_states.shape
         logits_flat = self.audio_heads(hidden_states)
-        # Shape: [B, S, C, Vocab] -> [B, C, S, Vocab]
-        audio_logits = logits_flat.view(
-            batch_size,
-            seq_len,
-            self.config.num_audio_codebook,
-            self.config.audio_vocab_size,
-        ).permute(0, 2, 1, 3)
+
+        if self.config.is_uniform_vocab:
+            # Fast-path: uniform per-codebook vocab.
+            # Shape: [B, S, C, V] -> [B, C, S, V]
+            vocab_sizes = self.config.audio_vocab_sizes
+            audio_logits = logits_flat.view(
+                batch_size,
+                seq_len,
+                self.config.num_audio_codebook,
+                vocab_sizes[0],
+            ).permute(0, 2, 1, 3)
+        else:
+            # Heterogeneous per-codebook vocab: slice per codebook and pad to
+            # V_max with -inf. -inf slots contribute 0 to softmax and receive no
+            # gradient, so they are inert.
+            vocab_sizes = self.config.audio_vocab_sizes
+            offsets = self.codebook_layer_offsets.tolist()
+            v_max = max(vocab_sizes)
+            audio_logits = torch.full(
+                (batch_size, self.config.num_audio_codebook, seq_len, v_max),
+                float("-inf"),
+                dtype=logits_flat.dtype,
+                device=logits_flat.device,
+            )
+            for c, (start, v_c) in enumerate(zip(offsets, vocab_sizes)):
+                audio_logits[:, c, :, :v_c] = logits_flat[:, :, start : start + v_c]
 
         if labels is not None:
 
@@ -1085,13 +1163,10 @@ class OmniVoice(PreTrainedModel):
             self.device
         )  # [1, C, N2]
 
-        # Target: all MASK
-        target_audio_tokens = torch.full(
-            (1, self.config.num_audio_codebook, num_target_tokens),
-            self.config.audio_mask_id,
-            dtype=torch.long,
-            device=self.device,
-        )
+        # Target: all MASK (per-codebook mask IDs broadcast to (1, C, T)).
+        target_audio_tokens = self.audio_mask_ids_t.view(1, -1, 1).expand(
+            1, self.config.num_audio_codebook, num_target_tokens
+        ).contiguous().to(self.device)
 
         # Conditional input
         parts = [style_tokens, text_tokens]
@@ -1158,14 +1233,11 @@ class OmniVoice(PreTrainedModel):
 
         c_lens = [inp["input_ids"].size(2) for inp in inputs_list]
         max_c_len = max(c_lens)
-        pad_id = self.config.audio_mask_id  # Or any other tokens
 
-        batch_input_ids = torch.full(
-            (2 * B, self.config.num_audio_codebook, max_c_len),
-            pad_id,
-            dtype=torch.long,
-            device=self.device,
-        )
+        # Per-codebook mask IDs broadcast to (2B, C, max_c_len) as the pad pattern.
+        batch_input_ids = self.audio_mask_ids_t.view(1, -1, 1).expand(
+            2 * B, self.config.num_audio_codebook, max_c_len
+        ).contiguous().to(self.device)
         batch_audio_mask = torch.zeros(
             (2 * B, max_c_len), dtype=torch.bool, device=self.device
         )
@@ -1189,12 +1261,9 @@ class OmniVoice(PreTrainedModel):
                 pad_diag = torch.arange(u_len, max_c_len, device=self.device)
                 batch_attention_mask[B + i, :, pad_diag, pad_diag] = True
 
-        tokens = torch.full(
-            (B, self.config.num_audio_codebook, max(task.target_lens)),
-            self.config.audio_mask_id,
-            dtype=torch.long,
-            device=self.device,
-        )
+        tokens = self.audio_mask_ids_t.view(1, -1, 1).expand(
+            B, self.config.num_audio_codebook, max(task.target_lens)
+        ).contiguous().to(self.device)
 
         timesteps = _get_time_steps(
             t_start=0.0,
@@ -1253,8 +1322,11 @@ class OmniVoice(PreTrainedModel):
                     scores = _gumbel_sample(scores, gen_config.position_temperature)
 
                 sample_tokens = tokens[i : i + 1, :, :t_len]
+                # Per-codebook mask ID check: compare against mask IDs broadcast
+                # across (1, C, 1).
+                mask_ids_bc = self.audio_mask_ids_t.view(1, -1, 1)
                 scores.masked_fill_(
-                    sample_tokens != self.config.audio_mask_id, -float("inf")
+                    sample_tokens != mask_ids_bc, -float("inf")
                 )
 
                 _, topk_idx = torch.topk(scores.flatten(), k)
@@ -1280,7 +1352,15 @@ class OmniVoice(PreTrainedModel):
         else:
             log_probs = F.log_softmax(c_logits, dim=-1)
 
-        log_probs[..., self.config.audio_mask_id] = -float("inf")
+        # Forbid sampling the MASK token for each codebook. Use scatter since
+        # each codebook has its own mask index (and vocab size may differ).
+        # log_probs shape: (1, C, T, V_max)
+        mask_idx = (
+            self.audio_mask_ids_t.view(1, -1, 1, 1)
+            .expand(log_probs.size(0), -1, log_probs.size(2), 1)
+            .to(log_probs.device)
+        )
+        log_probs.scatter_(-1, mask_idx, float("-inf"))
 
         if gen_config.class_temperature > 0.0:
             filtered_probs = _filter_top_k(log_probs, ratio=0.1)

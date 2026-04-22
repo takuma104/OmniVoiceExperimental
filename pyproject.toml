@@ -54,6 +54,11 @@ eval = [
     "unidecode",            # Unicode normalization
 ]
 
+# xcodec2 audio tokenizer (FSQ, 50 Hz, 16 kHz). Weights are cc-by-nc-4.0.
+xcodec2 = [
+    "xcodec2==0.1.5",
+]
+
 [project.scripts]
 omnivoice-infer = "omnivoice.cli.infer:main"
 omnivoice-infer-batch = "omnivoice.cli.infer_batch:main"
