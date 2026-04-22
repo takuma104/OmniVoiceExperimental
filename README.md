@@ -12,6 +12,8 @@
   <a href="https://arxiv.org/abs/2604.00688"><img src="https://img.shields.io/badge/arXiv-Paper-B31B1B.svg"></a>
   &nbsp;
   <a href="https://zhu-han.github.io/omnivoice"><img src="https://img.shields.io/badge/GitHub.io-Demo_Page-blue?logo=GitHub&style=flat-square"></a>
+  &nbsp;
+  <a href="https://colab.research.google.com/github/k2-fsa/OmniVoice/blob/master/docs/OmniVoice.ipynb"><img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab"></a>
 </p>
 
 OmniVoice is a state-of-the-art massively multilingual zero-shot text-to-speech (TTS) model supporting over 600 languages. Built on a novel diffusion language model-style architecture, it generates high-quality speech with superior inference speed, supporting voice cloning and voice design.
@@ -94,8 +96,9 @@ Try OmniVoice without coding:
 
 - Launch the local web UI: `omnivoice-demo --ip 0.0.0.0 --port 8001`
 
-
 - Or try it directly on [HuggingFace Space](https://huggingface.co/spaces/k2-fsa/OmniVoice)
+
+- Or run it in Google Colab: [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/k2-fsa/OmniVoice/blob/master/docs/OmniVoice.ipynb)
 
 > If you have trouble connecting to HuggingFace when downloading the pre-trained models, set `export HF_ENDPOINT="https://hf-mirror.com"` before running.
 
@@ -113,8 +116,8 @@ Clone a voice from a short reference audio. Provide `ref_audio` and `ref_text`:
 
 ```python
 from omnivoice import OmniVoice
+import soundfile as sf
 import torch
-import torchaudio
 
 model = OmniVoice.from_pretrained(
     "k2-fsa/OmniVoice",
@@ -127,18 +130,21 @@ audio = model.generate(
     text="Hello, this is a test of zero-shot voice cloning.",
     ref_audio="ref.wav",
     ref_text="Transcription of the reference audio.",
-) # audio is a list of `torch.Tensor` with shape (1, T) at 24 kHz.
+) # audio is a list of `np.ndarray` with shape (T,) at 24 kHz.
 
 # If you don't want to input `ref_text` manually, you can directly omit the `ref_text`.
 # The model will use Whisper ASR to auto-transcribe it.
 
-torchaudio.save("out.wav", audio[0], 24000)
+sf.write("out.wav", audio[0], 24000)
 ```
 
 > **Tips**
 >
 > - Use a 3–10 seconds reference audio clip. Longer audio slows down inference and may degrade cloning quality.
+> - For standard pronunciation, use a reference audio in the **same language** as the target speech. In cross-lingual voice cloning (i.e., the reference audio and target speech are in different languages), the generated speech will carry an accent from the reference audio's language.
 > - For better results with Arabic numerals, normalize them to words first (e.g., "123" → "one hundred twenty-three") with text normalization tools (e.g., [WeTextProcessing](https://github.com/wenet-e2e/WeTextProcessing)).
+>
+> For more tips, see [docs/tips.md](docs/tips.md).
 
 ### Voice Design
 
@@ -154,6 +160,8 @@ audio = model.generate(
     instruct="female, low pitch, british accent",
 )
 ```
+
+> **Note**: Voice design was trained on Chinese and English data only. It can generalize to other languages, but results can be unstable for some low-resource languages.
 
 See [docs/voice-design.md](docs/voice-design.md) for the full attribute
 reference, Chinese equivalents, and usage tips.
@@ -263,11 +271,11 @@ omnivoice-infer-batch \
 
 The test list is a JSONL file where each line is a JSON object:
 ```json
-{"id": "sample_001", "text": "Hello world", "ref_audio": "/path/to/ref.wav", "ref_text": "Reference transcript", "instruct": "female, british accent", "language_id": "en", "language_name": "English", "duration": 10.0, "speed": 1.0}
+{"id": "sample_001", "text": "Hello world", "ref_audio": "/path/to/ref.wav", "ref_text": "Reference transcript", "instruct": "female, british accent", "language_id": "en", "duration": 10.0, "speed": 1.0}
 ```
 Only `id` and `text` are mandatory fields. `ref_audio` and `ref_text` are used in voice cloning mode. `instruct` is used in voice design mode. If no reference audio or instruct are provided, the model will generate text in a random voice.
 
-`language_id`, `language_name`, `duration`, and `speed` are optional. `duration` (in seconds) fixes the output length; `speed` controls the speaking rate. If `duration` and `speed` are both provided, `speed` will be ignored.
+`language_id`, `duration`, and `speed` are optional. `duration` (in seconds) fixes the output length; `speed` controls the speaking rate. If `duration` and `speed` are both provided, `speed` will be ignored.
 
 ---
 
@@ -286,6 +294,13 @@ You can also scan the QR code to join our wechat group or follow our wechat offi
 | Wechat Group | Wechat Official Account |
 | ------------ | ----------------------- |
 |![wechat](https://k2-fsa.org/zh-CN/assets/pic/wechat_group.jpg) |![wechat](https://k2-fsa.org/zh-CN/assets/pic/wechat_account.jpg) |
+
+---
+
+## Community Projects
+
+OmniVoice is supported by a growing ecosystem of community projects.
+Explore them in [Community Projects](docs/community-projects.md).
 
 ---
 

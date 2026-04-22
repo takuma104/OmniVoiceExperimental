@@ -143,6 +143,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Skip loading Whisper ASR model. Reference text auto-transcription"
         " will be unavailable.",
     )
+    parser.add_argument(
+        "--asr-model",
+        default="openai/whisper-large-v3-turbo",
+        help="ASR model path or HuggingFace repo id"
+        " (default: openai/whisper-large-v3-turbo).",
+    )
     return parser
 
 
@@ -213,8 +219,7 @@ def build_demo(
         except Exception as e:
             return None, f"Error: {type(e).__name__}: {e}"
 
-        waveform = audio[0].squeeze(0).numpy()  # (T,)
-        waveform = (waveform * 32767).astype(np.int16)
+        waveform = (audio[0] * 32767).astype(np.int16)
         return (sampling_rate, waveform), "Done."
 
     # Allow external wrappers (e.g. spaces.GPU for ZeroGPU Spaces)
@@ -524,6 +529,7 @@ def main(argv=None) -> int:
         device_map=device,
         dtype=torch.float16,
         load_asr=not args.no_asr,
+        asr_model_name=args.asr_model,
     )
     print("Model loaded.")
 
