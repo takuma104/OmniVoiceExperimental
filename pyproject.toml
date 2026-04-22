@@ -46,6 +46,7 @@ dependencies = [
     "iprogress>=0.4",
     "datasets>=4.8.4",
     "torchcodec>=0.7,<0.8",
+    "triton>=3.4.0",
 ]
 
 [project.optional-dependencies]

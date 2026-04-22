@@ -35,6 +35,7 @@ import argparse
 from omnivoice.training.builder import build_dataloaders, build_model_and_tokenizer
 from omnivoice.training.config import TrainingConfig
 from omnivoice.training.trainer import OmniTrainer
+from omnivoice.utils.flex_attention_patch import patch_flex_attention_for_sm12
 
 
 def main():
@@ -49,6 +50,8 @@ def main():
         "--data_config", type=str, required=True, help="Path to data config JSON"
     )
     args = parser.parse_args()
+
+    patch_flex_attention_for_sm12()
 
     # 1. Load Configuration
     config = TrainingConfig.from_json(args.train_config)
