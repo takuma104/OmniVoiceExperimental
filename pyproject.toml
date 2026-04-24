@@ -50,7 +50,7 @@ dependencies = [
     "iprogress>=0.4",
     "matplotlib>=3.10.8",
     "jiwer>=3.1.0",
-    "muon",
+    "muon-optimizer",
 ]
 
 [project.optional-dependencies]
@@ -87,8 +87,7 @@ torchaudio = [
 ]
 # third-party whl: https://github.com/Dao-AILab/flash-attention/issues/2299
 flash-attn = { url = "https://github.com/lesj0610/flash-attention/releases/download/v2.8.3-cu12-torch2.10-cp312/flash_attn-2.8.3%2Bcu12torch2.10cxx11abiTRUE-cp312-cp312-linux_x86_64.whl" }
-muon = { git = "https://github.com/KellerJordan/Muon" }
-
+muon-optimizer = { git = "https://github.com/KellerJordan/Muon" }
 
 [[tool.uv.index]]
 name = "pytorch-cuda"
