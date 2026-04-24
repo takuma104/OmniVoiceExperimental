@@ -188,9 +188,80 @@ class OmniTrainer:
             )
         return accelerator
 
+    def _build_muon_optimizer(self):
+        """Muon for LLM hidden weights, AdamW for everything else.
+
+        Partitioning follows the Muon README: 2D+ hidden weights inside the
+        LLM transformer body (excluding embeddings and the LM head) are
+        optimized by Muon; all other parameters (LLM embeddings, any LLM
+        biases/norms, and non-LLM modules like audio_embeddings and
+        audio_heads) are optimized by AdamW.
+        """
+        try:
+            from muon import MuonWithAuxAdam, SingleDeviceMuonWithAuxAdam
+        except ImportError as e:
+            raise ImportError(
+                "use_muon_optimizer requires the muon package. "
+                "Install it with: pip install git+https://github.com/KellerJordan/Muon"
+            ) from e
+
+        muon_params = []
+        aux_params = []
+
+        llm_param_ids = set()
+        for name, p in self.model.llm.named_parameters():
+            llm_param_ids.add(id(p))
+            if not p.requires_grad:
+                continue
+            lname = name.lower()
+            is_embed_or_head = "embed" in lname or "lm_head" in lname
+            if p.ndim >= 2 and not is_embed_or_head:
+                muon_params.append(p)
+            else:
+                aux_params.append(p)
+
+        for _, p in self.model.named_parameters():
+            if id(p) in llm_param_ids:
+                continue
+            if not p.requires_grad:
+                continue
+            aux_params.append(p)
+
+        param_groups = [
+            dict(
+                params=aux_params,
+                use_muon=False,
+                lr=self.config.learning_rate,
+                betas=(0.9, 0.95),
+                eps=1e-10,
+                weight_decay=self.config.weight_decay,
+            ),
+            dict(
+                params=muon_params,
+                use_muon=True,
+                lr=self.config.muon_lr,
+                momentum=self.config.muon_momentum,
+                weight_decay=self.config.muon_weight_decay,
+            ),
+        ]
+
+        is_distributed = self.accelerator.num_processes > 1
+        cls = MuonWithAuxAdam if is_distributed else SingleDeviceMuonWithAuxAdam
+        optimizer = cls(param_groups)
+        logger.info(
+            "Using Muon optimizer (%s): %d hidden weight params (Muon), "
+            "%d aux params (AdamW).",
+            cls.__name__,
+            len(muon_params),
+            len(aux_params),
+        )
+        return optimizer
+
     def create_optimizer_and_scheduler(self):
         """Default AdamW + configurable LR Scheduler."""
-        if getattr(self.config, "use_8bit_optimizer", False):
+        if getattr(self.config, "use_muon_optimizer", False):
+            optimizer = self._build_muon_optimizer()
+        elif getattr(self.config, "use_8bit_optimizer", False):
             try:
                 import bitsandbytes as bnb
             except ImportError:
