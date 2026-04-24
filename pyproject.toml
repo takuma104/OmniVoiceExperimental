@@ -49,6 +49,7 @@ dependencies = [
     "triton>=3.4.0",
     "loguru>=0.7.3",
     "librosa>=0.11.0",
+    "muon-optimizer",
 ]
 
 [project.optional-dependencies]
@@ -83,6 +84,7 @@ torch = [
 torchaudio = [
   { index = "pytorch-cuda", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
 ]
+muon-optimizer = { git = "https://github.com/KellerJordan/Muon" }
 
 [[tool.uv.index]]
 name = "pytorch-cuda"
