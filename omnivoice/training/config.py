@@ -78,6 +78,12 @@ class TrainingConfig:
     deepspeed_config: Optional[str] = None
     use_8bit_optimizer: bool = False
 
+    # Muon optimizer (applied to LLM hidden weights only; AdamW for the rest)
+    use_muon_optimizer: bool = False
+    muon_lr: float = 0.02
+    muon_momentum: float = 0.95
+    muon_weight_decay: float = 0.01
+
     # Logging
     logging_steps: int = 100
     eval_steps: int = 1000
