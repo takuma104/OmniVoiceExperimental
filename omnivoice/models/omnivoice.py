@@ -165,6 +165,8 @@ class OmniVoiceConfig(PretrainedConfig):
         num_audio_codebook: int = 8,
         audio_codebook_weights: Optional[list[float]] = None,
         llm_config: Optional[Union[dict, PretrainedConfig]] = None,
+        mel_mode: bool = False,
+        num_mels: int = 128,
         **kwargs,
     ):
 
@@ -180,6 +182,8 @@ class OmniVoiceConfig(PretrainedConfig):
         if audio_codebook_weights is None:
             audio_codebook_weights = [8, 8, 6, 6, 4, 4, 2, 2]
         self.audio_codebook_weights = audio_codebook_weights
+        self.mel_mode = mel_mode
+        self.num_mels = num_mels
 
 
 def _resolve_model_path(name_or_path: str) -> str:
@@ -206,25 +210,48 @@ class OmniVoice(PreTrainedModel):
             # Otherwise, initialize the LLM from the config.
             self.llm = AutoModel.from_config(self.config.llm_config)
 
-        self.audio_embeddings = nn.Embedding(
-            config.num_audio_codebook * config.audio_vocab_size,
-            self.config.llm_config.hidden_size,
-        )
-        self.register_buffer(
-            "codebook_layer_offsets",
-            torch.arange(config.num_audio_codebook) * config.audio_vocab_size,
-        )
+        hidden = self.config.llm_config.hidden_size
 
-        self.audio_heads = nn.Linear(
-            self.config.llm_config.hidden_size,
-            config.num_audio_codebook * config.audio_vocab_size,
-            bias=False,
-        )
+        if config.mel_mode:
+            # MALLE-style continuous-mel branch.
+            # Pre-net: 3-layer MLP projecting mel-frame -> LM hidden dim.
+            self.mel_prenet = nn.Sequential(
+                nn.Linear(config.num_mels, hidden),
+                nn.ReLU(),
+                nn.Dropout(0.5),
+                nn.Linear(hidden, hidden),
+                nn.ReLU(),
+                nn.Dropout(0.5),
+                nn.Linear(hidden, hidden),
+            )
+            # Learnable embedding for masked mel positions.
+            self.mel_mask_embed = nn.Parameter(torch.zeros(hidden))
+            # Output regression head: hidden -> num_mels.
+            self.mel_head = nn.Linear(hidden, config.num_mels)
+            # Discrete-token modules are unused in mel_mode; do not allocate.
+            self.audio_embeddings = None
+            self.audio_heads = None
+            self.normalized_audio_codebook_weights = None
+        else:
+            self.audio_embeddings = nn.Embedding(
+                config.num_audio_codebook * config.audio_vocab_size,
+                hidden,
+            )
+            self.register_buffer(
+                "codebook_layer_offsets",
+                torch.arange(config.num_audio_codebook) * config.audio_vocab_size,
+            )
 
-        self.normalized_audio_codebook_weights = [
-            w / sum(config.audio_codebook_weights)
-            for w in config.audio_codebook_weights
-        ]
+            self.audio_heads = nn.Linear(
+                hidden,
+                config.num_audio_codebook * config.audio_vocab_size,
+                bias=False,
+            )
+
+            self.normalized_audio_codebook_weights = [
+                w / sum(config.audio_codebook_weights)
+                for w in config.audio_codebook_weights
+            ]
 
         self.post_init()
 
@@ -254,26 +281,39 @@ class OmniVoice(PreTrainedModel):
             if not train_mode:
                 model.text_tokenizer = AutoTokenizer.from_pretrained(resolved_path)
 
-                audio_tokenizer_path = os.path.join(resolved_path, "audio_tokenizer")
-
-                if not os.path.isdir(audio_tokenizer_path):
-                    audio_tokenizer_path = _resolve_model_path(
-                        "eustlb/higgs-audio-v2-tokenizer"
+                if model.config.mel_mode:
+                    # MALLE-style mel mode: vocoder is BigVGAN, not a discrete
+                    # audio tokenizer. Load lazily via load_vocoder() if needed.
+                    model.audio_tokenizer = None
+                    model.feature_extractor = None
+                    model.sampling_rate = None
+                else:
+                    audio_tokenizer_path = os.path.join(
+                        resolved_path, "audio_tokenizer"
                     )
 
-                # higgs-audio-v2-tokenizer does not support MPS
-                # (output channels > 65536)
-                tokenizer_device = (
-                    "cpu" if str(model.device).startswith("mps") else model.device
-                )
-                model.audio_tokenizer = HiggsAudioV2TokenizerModel.from_pretrained(
-                    audio_tokenizer_path, device_map=tokenizer_device
-                )
-                model.feature_extractor = AutoFeatureExtractor.from_pretrained(
-                    audio_tokenizer_path
-                )
+                    if not os.path.isdir(audio_tokenizer_path):
+                        audio_tokenizer_path = _resolve_model_path(
+                            "eustlb/higgs-audio-v2-tokenizer"
+                        )
 
-                model.sampling_rate = model.feature_extractor.sampling_rate
+                    # higgs-audio-v2-tokenizer does not support MPS
+                    # (output channels > 65536)
+                    tokenizer_device = (
+                        "cpu"
+                        if str(model.device).startswith("mps")
+                        else model.device
+                    )
+                    model.audio_tokenizer = (
+                        HiggsAudioV2TokenizerModel.from_pretrained(
+                            audio_tokenizer_path, device_map=tokenizer_device
+                        )
+                    )
+                    model.feature_extractor = AutoFeatureExtractor.from_pretrained(
+                        audio_tokenizer_path
+                    )
+
+                    model.sampling_rate = model.feature_extractor.sampling_rate
 
                 model.duration_estimator = RuleDurationEstimator()
 
@@ -372,6 +412,34 @@ class OmniVoice(PreTrainedModel):
 
         return torch.where(audio_mask.unsqueeze(-1), audio_embeds, text_embeds)
 
+    def _prepare_embed_inputs_mel(
+        self,
+        input_ids: torch.Tensor,
+        audio_mask: torch.Tensor,
+        mel_input: torch.Tensor,
+        mel_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Prepare embeddings for mel_mode.
+
+        Args:
+            input_ids: [B, 1, L] text token ids (audio positions hold zeros).
+            audio_mask: [B, L] True at audio (mel-frame) positions.
+            mel_input: [B, L, num_mels] raw mel values at unmasked audio
+                positions; zero elsewhere.
+            mel_mask: [B, L] True at masked audio positions; False at text
+                positions and at unmasked (prompt) audio positions.
+        Returns:
+            [B, L, hidden] embeddings.
+        """
+        text_embeds = self.get_input_embeddings()(input_ids[:, 0, :])
+        audio_embeds = self.mel_prenet(mel_input)
+        # Replace masked mel positions with the learnable mask embedding.
+        mask_embed = self.mel_mask_embed.view(1, 1, -1).expand_as(audio_embeds)
+        audio_embeds = torch.where(
+            mel_mask.unsqueeze(-1), mask_embed, audio_embeds
+        )
+        return torch.where(audio_mask.unsqueeze(-1), audio_embeds, text_embeds)
+
     def forward(
         self,
         input_ids: torch.LongTensor,
@@ -380,9 +448,21 @@ class OmniVoice(PreTrainedModel):
         attention_mask: Optional[torch.Tensor] = None,
         document_ids: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
+        mel_input: Optional[torch.Tensor] = None,
+        mel_target: Optional[torch.Tensor] = None,
+        mel_mask: Optional[torch.Tensor] = None,
+        mel_loss_mask: Optional[torch.Tensor] = None,
     ):
 
-        inputs_embeds = self._prepare_embed_inputs(input_ids, audio_mask)
+        if self.config.mel_mode:
+            assert (
+                mel_input is not None and mel_mask is not None
+            ), "mel_mode requires mel_input and mel_mask"
+            inputs_embeds = self._prepare_embed_inputs_mel(
+                input_ids, audio_mask, mel_input, mel_mask
+            )
+        else:
+            inputs_embeds = self._prepare_embed_inputs(input_ids, audio_mask)
 
         if attention_mask is None and document_ids is not None:
             attention_mask = create_block_mask(
@@ -406,6 +486,21 @@ class OmniVoice(PreTrainedModel):
         hidden_states = llm_outputs[0]
 
         loss = None
+
+        if self.config.mel_mode:
+            mel_pred = self.mel_head(hidden_states)  # [B, L, num_mels]
+
+            if mel_target is not None and mel_loss_mask is not None:
+                # Compute L1 + L2 regression loss only on masked positions.
+                mask_f = mel_loss_mask.unsqueeze(-1).to(mel_pred.dtype)
+                diff = (mel_pred - mel_target) * mask_f
+                # Per-frame normalization: sum over mel dim, mean over masked frames.
+                n_valid = mel_loss_mask.to(mel_pred.dtype).sum().clamp(min=1.0)
+                l1 = diff.abs().sum() / (n_valid * mel_pred.size(-1))
+                l2 = (diff * diff).sum() / (n_valid * mel_pred.size(-1))
+                loss = l1 + l2
+
+            return OmniVoiceModelOutput(loss=loss, logits=mel_pred)
 
         # Shape: [B, S, C * Vocab]
         batch_size, seq_len, _ = hidden_states.shape

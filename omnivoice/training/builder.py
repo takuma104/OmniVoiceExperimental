@@ -37,9 +37,14 @@ from transformers import logging as hf_logging
 from transformers.trainer_utils import seed_worker
 
 from omnivoice.data.batching import PackingIterableDataset
-from omnivoice.data.collator import PackingDataCollator
-from omnivoice.data.dataset import WebDatasetReader, prepare_data_manifests_from_json
-from omnivoice.data.processor import OmniVoiceSampleProcessor
+from omnivoice.data.collator import MelPackingDataCollator, PackingDataCollator
+from omnivoice.data.dataset import (
+    ParquetDatasetReader,
+    WebDatasetReader,
+    prepare_data_manifests_from_json,
+    prepare_parquet_manifests_from_json,
+)
+from omnivoice.data.processor import MelSampleProcessor, OmniVoiceSampleProcessor
 from omnivoice.models.omnivoice import OmniVoice, OmniVoiceConfig, _resolve_model_path
 from omnivoice.training.config import TrainingConfig
 
@@ -95,6 +100,8 @@ def build_model_and_tokenizer(
             num_audio_codebook=config.num_audio_codebook,
             audio_codebook_weights=config.audio_codebook_weights,
             llm_config=llm_config,
+            mel_mode=config.mel_mode,
+            num_mels=config.mel_num_mels,
         )
 
         original_level = hf_logging.get_verbosity()
@@ -128,27 +135,74 @@ def build_dataloaders(
     """Setup Data Pipeline: Manifests -> WDS -> Packing -> Loaders."""
     logger.info("Initializing Data Readers...")
 
-    processor = OmniVoiceSampleProcessor(
-        text_tokenizer=tokenizer,
-        num_channels=config.num_audio_codebook,
-        audio_mask_id=config.audio_mask_id,
-        prompt_ratio_range=config.prompt_ratio_range,
-        mask_ratio_range=config.mask_ratio_range,
-        drop_cond_ratio=config.drop_cond_ratio,
-        language_ratio=config.language_ratio,
-        use_pinyin_ratio=config.use_pinyin_ratio,
-        instruct_ratio=config.instruct_ratio,
-        only_instruct_ratio=config.only_instruct_ratio,
-    )
-
-    train_manifests, dev_manifests = prepare_data_manifests_from_json(
-        config.data_config
-    )
-    raw_train_ds = WebDatasetReader(manifests=train_manifests, evaluation=False)
+    if config.mel_mode:
+        processor = MelSampleProcessor(
+            text_tokenizer=tokenizer,
+            num_mels=config.mel_num_mels,
+            mel_sample_rate=config.mel_sample_rate,
+            mel_n_fft=config.mel_n_fft,
+            mel_hop_size=config.mel_hop_size,
+            mel_win_size=config.mel_win_size,
+            mel_fmin=config.mel_fmin,
+            mel_fmax=config.mel_fmax,
+            prompt_ratio_range=config.prompt_ratio_range,
+            mask_ratio_range=config.mask_ratio_range,
+            drop_cond_ratio=config.drop_cond_ratio,
+            language_ratio=config.language_ratio,
+            instruct_ratio=config.instruct_ratio,
+            only_instruct_ratio=config.only_instruct_ratio,
+        )
+        train_paths, dev_paths = prepare_parquet_manifests_from_json(
+            config.data_config
+        )
+        raw_train_ds = ParquetDatasetReader(
+            parquet_paths=train_paths,
+            sample_rate=config.mel_sample_rate,
+            evaluation=False,
+            max_duration=config.mel_max_duration,
+            min_duration=config.mel_min_duration,
+        )
+        collate_fn = MelPackingDataCollator(processor, config.batch_tokens)
+        raw_dev_ds_factory = (
+            (
+                lambda: ParquetDatasetReader(
+                    parquet_paths=dev_paths,
+                    sample_rate=config.mel_sample_rate,
+                    evaluation=True,
+                    max_duration=config.mel_max_duration,
+                    min_duration=config.mel_min_duration,
+                )
+            )
+            if dev_paths
+            else None
+        )
+    else:
+        processor = OmniVoiceSampleProcessor(
+            text_tokenizer=tokenizer,
+            num_channels=config.num_audio_codebook,
+            audio_mask_id=config.audio_mask_id,
+            prompt_ratio_range=config.prompt_ratio_range,
+            mask_ratio_range=config.mask_ratio_range,
+            drop_cond_ratio=config.drop_cond_ratio,
+            language_ratio=config.language_ratio,
+            use_pinyin_ratio=config.use_pinyin_ratio,
+            instruct_ratio=config.instruct_ratio,
+            only_instruct_ratio=config.only_instruct_ratio,
+        )
+        train_manifests, dev_manifests = prepare_data_manifests_from_json(
+            config.data_config
+        )
+        raw_train_ds = WebDatasetReader(manifests=train_manifests, evaluation=False)
+        collate_fn = PackingDataCollator(processor, config.batch_tokens)
+        raw_dev_ds_factory = (
+            (
+                lambda: WebDatasetReader(manifests=dev_manifests, evaluation=True)
+            )
+            if dev_manifests
+            else None
+        )
 
     train_dataset = PackingIterableDataset(raw_train_ds, processor, config.batch_tokens)
-
-    collate_fn = PackingDataCollator(processor, config.batch_tokens)
 
     init_fn = partial(
         seed_worker,
@@ -167,8 +221,8 @@ def build_dataloaders(
     )
 
     eval_loader = None
-    if dev_manifests:
-        raw_dev_ds = WebDatasetReader(manifests=dev_manifests, evaluation=True)
+    if raw_dev_ds_factory is not None:
+        raw_dev_ds = raw_dev_ds_factory()
         dev_dataset = PackingIterableDataset(raw_dev_ds, processor, config.batch_tokens)
         eval_loader = DataLoader(
             dev_dataset,

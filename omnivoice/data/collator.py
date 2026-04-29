@@ -27,6 +27,92 @@ from typing import Any, Dict, List
 import torch
 
 
+class MelPackingDataCollator:
+    """Packs samples produced by ``MelSampleProcessor`` into a fixed-length batch.
+
+    Concatenates the per-sample sequences along the sequence axis up to
+    ``batch_tokens`` and right-pads the remainder. Builds ``document_ids``
+    and ``position_ids`` so the LLM can apply per-document attention masks
+    via flex_attention.
+    """
+
+    def __init__(self, processor, batch_tokens: int):
+        self.batch_tokens = batch_tokens
+        self.processor = processor
+
+    def __call__(self, processed_samples: List[Dict[str, Any]]) -> Dict[str, Any]:
+        target_length = self.batch_tokens
+
+        input_ids = torch.cat(
+            [s["input_ids"] for s in processed_samples], dim=1
+        )  # [1, Total_L]
+        mel_input = torch.cat(
+            [s["mel_input"] for s in processed_samples], dim=0
+        )  # [Total_L, M]
+        mel_target = torch.cat(
+            [s["mel_target"] for s in processed_samples], dim=0
+        )  # [Total_L, M]
+        mel_mask = torch.cat(
+            [s["mel_mask"] for s in processed_samples], dim=0
+        )  # [Total_L]
+        mel_loss_mask = torch.cat(
+            [s["mel_loss_mask"] for s in processed_samples], dim=0
+        )  # [Total_L]
+        audio_mask = torch.cat(
+            [s["audio_mask"] for s in processed_samples], dim=0
+        )  # [Total_L]
+        position_ids = torch.cat(
+            [torch.arange(s["length"], dtype=torch.long) for s in processed_samples],
+            dim=0,
+        )  # [Total_L]
+
+        document_ids = torch.cat(
+            [
+                torch.full((s["length"],), i, dtype=torch.int32)
+                for i, s in enumerate(processed_samples)
+            ],
+            dim=0,
+        )
+
+        pad_length = target_length - input_ids.shape[1]
+
+        pad_token = self.processor.text_tokenizer.pad_token_id
+
+        input_ids = torch.nn.functional.pad(
+            input_ids, pad=(0, pad_length), value=pad_token
+        )
+        mel_input = torch.nn.functional.pad(
+            mel_input, pad=(0, 0, 0, pad_length), value=0.0
+        )
+        mel_target = torch.nn.functional.pad(
+            mel_target, pad=(0, 0, 0, pad_length), value=0.0
+        )
+        mel_mask = torch.nn.functional.pad(mel_mask, pad=(0, pad_length), value=False)
+        mel_loss_mask = torch.nn.functional.pad(
+            mel_loss_mask, pad=(0, pad_length), value=False
+        )
+        audio_mask = torch.nn.functional.pad(
+            audio_mask, pad=(0, pad_length), value=False
+        )
+        position_ids = torch.nn.functional.pad(
+            position_ids, pad=(0, pad_length), value=0
+        )
+        document_ids = torch.nn.functional.pad(
+            document_ids, pad=(0, pad_length), value=-1
+        )
+
+        return {
+            "input_ids": input_ids.unsqueeze(0),  # [1, 1, L]
+            "mel_input": mel_input.unsqueeze(0),  # [1, L, M]
+            "mel_target": mel_target.unsqueeze(0),  # [1, L, M]
+            "mel_mask": mel_mask.unsqueeze(0),  # [1, L]
+            "mel_loss_mask": mel_loss_mask.unsqueeze(0),  # [1, L]
+            "audio_mask": audio_mask.unsqueeze(0),  # [1, L]
+            "position_ids": position_ids.unsqueeze(0),  # [1, L]
+            "document_ids": document_ids.unsqueeze(0),  # [1, L]
+        }
+
+
 class PackingDataCollator:
     def __init__(self, processor, batch_tokens: int):
         self.batch_tokens = batch_tokens

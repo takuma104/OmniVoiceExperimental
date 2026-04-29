@@ -1,0 +1,20 @@
+{
+    "train":
+    [
+        {
+            "parquet_path": [
+                "data/parquet/train_shard_000.parquet",
+                "data/parquet/train_shard_001.parquet"
+            ],
+            "repeat": 1
+        }
+    ],
+    "dev":
+    [
+        {
+            "parquet_path": [
+                "data/parquet/dev.parquet"
+            ]
+        }
+    ]
+}

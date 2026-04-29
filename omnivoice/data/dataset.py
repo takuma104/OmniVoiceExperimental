@@ -356,6 +356,149 @@ class WebDatasetReader(IterableDataReader):
         return self.num_items
 
 
+def prepare_parquet_manifests_from_json(
+    data_config: str,
+) -> Tuple[List[str], List[str]]:
+    """Prepare parquet path lists for mel_mode training.
+
+    JSON format:
+    {
+        "train": [{"parquet_path": ["a.parquet", "b.parquet"], "repeat": 1}],
+        "dev":   [{"parquet_path": ["c.parquet"]}]
+    }
+    """
+    train_paths: List[str] = []
+    dev_paths: List[str] = []
+    with open(data_config, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    for item in data.get("train", []):
+        repeat = item.get("repeat", 1)
+        for p in item["parquet_path"]:
+            assert os.path.isfile(p), f"{p} is not a file."
+            train_paths.extend([p] * repeat)
+    for item in data.get("dev", []):
+        repeat = item.get("repeat", 1)
+        for p in item["parquet_path"]:
+            assert os.path.isfile(p), f"{p} is not a file."
+            dev_paths.extend([p] * repeat)
+    return train_paths, dev_paths
+
+
+class ParquetDatasetReader(IterableDataReader):
+    """Iterable reader for parquet files containing raw audio bytes.
+
+    Expected parquet schema (matches encode_audio_tokens_to_parquet.py source
+    format): ``row_id: int32, transcribe: string, audio_data: binary``.
+
+    Yields dicts of the form ``{"audio": Tensor(1, T), "label": dict}``,
+    matching the contract of ``WebDatasetReader`` so the same processor /
+    packing / collator pipeline can consume it.
+    """
+
+    def __init__(
+        self,
+        parquet_paths: List[str],
+        sample_rate: int = 44_100,
+        evaluation: bool = False,
+        normalize_audio: bool = True,
+        chunk_size: int = 256,
+        shuffle_files: bool = True,
+        max_duration: float = 30.0,
+        min_duration: float = 0.5,
+    ):
+        self.parquet_paths = list(parquet_paths)
+        self.sample_rate = sample_rate
+        self.evaluation = evaluation
+        self.normalize_audio = normalize_audio
+        self.chunk_size = chunk_size
+        self.shuffle_files = shuffle_files
+        self.max_duration = max_duration
+        self.min_duration = min_duration
+        self.epoch = 0
+        self._num_items: Optional[int] = None
+
+    def set_epoch(self, epoch: int):
+        self.epoch = epoch
+
+    def _get_shard_paths(self) -> List[str]:
+        paths = list(self.parquet_paths)
+        if self.shuffle_files and not self.evaluation:
+            random.Random(self.epoch).shuffle(paths)
+
+        # Split across distributed ranks.
+        if dist.is_available() and dist.is_initialized():
+            rank = dist.get_rank()
+            world_size = dist.get_world_size()
+            paths = [p for i, p in enumerate(paths) if i % world_size == rank]
+
+        # Split across DataLoader workers.
+        worker_info = torch.utils.data.get_worker_info()
+        if worker_info is not None:
+            paths = [
+                p
+                for i, p in enumerate(paths)
+                if i % worker_info.num_workers == worker_info.id
+            ]
+        return paths
+
+    def __iter__(self) -> Iterator[Dict[str, Any]]:
+        import pyarrow.parquet as pq
+
+        for path in self._get_shard_paths():
+            try:
+                pf = pq.ParquetFile(path)
+            except Exception as e:
+                logging.warning(f"Failed to open parquet {path}: {e}")
+                continue
+
+            for batch in pf.iter_batches(
+                batch_size=self.chunk_size,
+                columns=["row_id", "transcribe", "audio_data"],
+            ):
+                rows = batch.to_pylist()
+                if not self.evaluation:
+                    random.shuffle(rows)
+                for row in rows:
+                    audio_bytes = row.get("audio_data")
+                    text = row.get("transcribe", "")
+                    if audio_bytes is None or not text:
+                        continue
+                    try:
+                        wav = load_audio_bytes(audio_bytes, self.sample_rate)
+                    except Exception as e:
+                        logging.warning(
+                            f"Failed to load audio (row_id={row.get('row_id')}): {e}"
+                        )
+                        continue
+                    duration = wav.shape[1] / self.sample_rate
+                    if duration < self.min_duration or duration > self.max_duration:
+                        continue
+                    audio = torch.from_numpy(wav)
+                    if self.normalize_audio:
+                        audio = (audio / (audio.abs().max() + 1e-7)) * 0.9
+                    yield {
+                        "audio": audio,
+                        "audio_duration": duration,
+                        "label": {
+                            "id": row.get("row_id"),
+                            "text": text,
+                        },
+                    }
+
+    def __len__(self) -> int:
+        if self._num_items is None:
+            import pyarrow.parquet as pq
+
+            n = 0
+            for path in self.parquet_paths:
+                try:
+                    n += pq.ParquetFile(path).metadata.num_rows
+                except Exception as e:
+                    logging.warning(f"Could not read row count from {path}: {e}")
+            self._num_items = n
+        return self._num_items
+
+
 class JsonlDatasetReader(IterableDataReader):
     """Read raw JSONL and load audio files, matching WebDatasetReader output format.
 

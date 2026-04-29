@@ -31,6 +31,9 @@ from typing import Any, Dict
 
 import torch
 
+from bigvgan.env import AttrDict
+from bigvgan.meldataset import get_mel_spectrogram
+
 
 class OmniVoiceSampleProcessor:
     """
@@ -170,6 +173,170 @@ class OmniVoiceSampleProcessor:
         }
 
         return return_dict
+
+
+class MelSampleProcessor:
+    """Sample processor for MALLE-style continuous-mel training.
+
+    Reads raw waveform from the upstream dataset, computes mel-spectrogram
+    on-the-fly using BigVGAN's ``get_mel_spectrogram``, applies frame-level
+    random prompt/mask augmentation, and emits a packed sequence of
+    ``[text_tokens; mel_frames]`` together with side tensors required by the
+    mel-mode model.
+
+    Returned sample dict (per sequence, before collation):
+        input_ids       LongTensor [1, L]      text ids at text positions; 0 elsewhere
+        mel_input       FloatTensor[L, M]      raw mel at non-masked audio positions; 0 elsewhere
+        mel_target      FloatTensor[L, M]      ground truth mel at audio positions; 0 elsewhere
+        mel_mask        BoolTensor [L]         True at masked audio positions (replaced by mask embed)
+        mel_loss_mask   BoolTensor [L]         True at positions where regression loss is computed
+        audio_mask      BoolTensor [L]         True at audio (mel-frame) positions
+        length          int                    L
+    """
+
+    def __init__(
+        self,
+        text_tokenizer: Any,
+        num_mels: int,
+        mel_sample_rate: int,
+        mel_n_fft: int,
+        mel_hop_size: int,
+        mel_win_size: int,
+        mel_fmin: int,
+        mel_fmax: Any,
+        prompt_ratio_range: tuple,
+        mask_ratio_range: tuple,
+        drop_cond_ratio: float,
+        language_ratio: float,
+        instruct_ratio: float,
+        only_instruct_ratio: float,
+    ):
+        self.text_tokenizer = text_tokenizer
+        self.num_mels = num_mels
+        self.prompt_ratio_range = prompt_ratio_range
+        self.mask_ratio_range = mask_ratio_range
+        self.drop_cond_ratio = drop_cond_ratio
+        self.language_ratio = language_ratio
+        self.instruct_ratio = instruct_ratio
+        self.only_instruct_ratio = only_instruct_ratio
+        # BigVGAN-compatible mel hyper-parameters.
+        self.mel_h = AttrDict(
+            {
+                "n_fft": mel_n_fft,
+                "num_mels": num_mels,
+                "sampling_rate": mel_sample_rate,
+                "hop_size": mel_hop_size,
+                "win_size": mel_win_size,
+                "fmin": mel_fmin,
+                "fmax": mel_fmax,
+            }
+        )
+
+    def _compute_mel(self, audio: torch.Tensor) -> torch.Tensor:
+        """audio: (1, T_audio) -> mel: (T_frame, num_mels)."""
+        audio = audio.float()
+        if audio.dim() == 1:
+            audio = audio.unsqueeze(0)
+        # get_mel_spectrogram returns [B, num_mels, T_frame]; we feed [1, T].
+        mel = get_mel_spectrogram(audio, self.mel_h)  # [1, M, T_frame]
+        mel = mel.squeeze(0).transpose(0, 1).contiguous()  # [T_frame, M]
+        return mel
+
+    def __call__(self, sample: Dict[str, Any]) -> Dict[str, Any]:
+        audio = sample["audio"]  # (1, T_audio) float tensor in [-1, 1]
+        mel = self._compute_mel(audio)  # [T_frame, M]
+        T = mel.size(0)
+        if T < 2:
+            # Too short to mask anything meaningful; let upstream skip it.
+            raise ValueError(f"Mel too short: T={T}")
+
+        drop_cond = random.uniform(0, 1) < self.drop_cond_ratio
+        if drop_cond:
+            prompt_ratio = 0.0
+            drop_text = True
+            use_language = False
+            use_instruct = False
+        else:
+            prompt_ratio = random.uniform(*self.prompt_ratio_range)
+            drop_text = False
+            use_language = random.uniform(0, 1) < self.language_ratio
+            use_instruct = random.uniform(0, 1) < self.instruct_ratio
+            if use_instruct and random.uniform(0, 1) < self.only_instruct_ratio:
+                prompt_ratio = 0.0
+
+        mask_ratio = random.uniform(*self.mask_ratio_range)
+
+        # --- Style ---
+        language = (
+            sample["label"].get("language_id", "None") if use_language else "None"
+        )
+        instruct = (
+            sample["label"].get("instruct", "None") if use_instruct else "None"
+        )
+        style = ""
+        style += f"<|lang_start|>{language}<|lang_end|>"
+        style += f"<|instruct_start|>{instruct}<|instruct_end|>"
+
+        # --- Text ---
+        text = sample["label"].get("text", sample["label"].get("transcribe", ""))
+        text_str = f"<|text_start|>{text}<|text_end|>"
+
+        # Tokenize style+text (single channel; mel_mode does not use codebooks).
+        if drop_text:
+            text_input_ids = torch.zeros((1, 0), dtype=torch.long)
+        else:
+            style_ids = self.text_tokenizer(
+                style, return_tensors="pt"
+            ).input_ids  # [1, N_style]
+            text_ids = self.text_tokenizer(
+                text_str, return_tensors="pt"
+            ).input_ids  # [1, N_text]
+            text_input_ids = torch.cat([style_ids, text_ids], dim=1)  # [1, N_text_total]
+        N_text = text_input_ids.size(1)
+
+        # --- Frame-level masking ---
+        prompt_length = int(T * prompt_ratio)
+        # Default: nothing masked (prompt region).
+        frame_mask_full = torch.zeros(T, dtype=torch.bool)
+        if T > prompt_length:
+            tail = torch.rand(T - prompt_length) < mask_ratio
+            frame_mask_full[prompt_length:] = tail
+
+        # mel_input: zero out masked positions (mask embedding will replace them).
+        mel_input_audio = mel.clone()
+        mel_input_audio[frame_mask_full] = 0.0
+        mel_target_audio = mel  # full ground truth at audio positions
+
+        # --- Build packed sequence (text first, then audio) ---
+        L = N_text + T
+
+        input_ids = torch.zeros((1, L), dtype=torch.long)
+        if N_text > 0:
+            input_ids[0, :N_text] = text_input_ids[0]
+
+        mel_input = torch.zeros((L, self.num_mels), dtype=mel.dtype)
+        mel_target = torch.zeros((L, self.num_mels), dtype=mel.dtype)
+        mel_input[N_text:] = mel_input_audio
+        mel_target[N_text:] = mel_target_audio
+
+        mel_mask = torch.zeros(L, dtype=torch.bool)
+        mel_mask[N_text:] = frame_mask_full
+
+        # Loss is only computed on masked frames (excluding prompt by construction).
+        mel_loss_mask = mel_mask.clone()
+
+        audio_mask = torch.zeros(L, dtype=torch.bool)
+        audio_mask[N_text:] = True
+
+        return {
+            "input_ids": input_ids,  # [1, L]
+            "mel_input": mel_input,  # [L, M]
+            "mel_target": mel_target,  # [L, M]
+            "mel_mask": mel_mask,  # [L]
+            "mel_loss_mask": mel_loss_mask,  # [L]
+            "audio_mask": audio_mask,  # [L]
+            "length": L,
+        }
 
 
 class OmniVoiceSimpleSampleProcessor:

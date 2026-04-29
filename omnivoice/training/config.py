@@ -51,6 +51,20 @@ class TrainingConfig:
     instruct_ratio: float = 1.0
     only_instruct_ratio: float = 0.5
 
+    # MALLE-style continuous-mel mode (replaces discrete audio tokens with
+    # mel-spectrogram frames). When True, the discrete audio_* fields above
+    # are ignored and mel_* fields below are used instead.
+    mel_mode: bool = False
+    mel_num_mels: int = 128
+    mel_sample_rate: int = 44100
+    mel_n_fft: int = 2048
+    mel_hop_size: int = 512
+    mel_win_size: int = 2048
+    mel_fmin: int = 0
+    mel_fmax: Optional[int] = None
+    mel_max_duration: float = 30.0  # seconds; samples longer than this are skipped
+    mel_min_duration: float = 0.5
+
     # Init settings
     resume_from_checkpoint: Optional[str] = None
     init_from_checkpoint: Optional[str] = None
