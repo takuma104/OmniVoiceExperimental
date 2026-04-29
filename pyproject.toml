@@ -46,10 +46,11 @@ dependencies = [
     "iprogress>=0.4",
     "datasets>=4.8.4",
     "torchcodec>=0.7,<0.8",
-    "triton>=3.4.0",
+    "triton>=3.4.0; sys_platform == 'linux' or sys_platform == 'win32'",
     "loguru>=0.7.3",
     "librosa>=0.11.0",
-    "muon-optimizer",
+    "muon-optimizer; sys_platform == 'linux' or sys_platform == 'win32'",
+    "matplotlib>=3.10.9",
 ]
 
 [project.optional-dependencies]
