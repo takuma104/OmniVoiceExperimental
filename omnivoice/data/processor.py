@@ -128,6 +128,8 @@ class OmniVoiceSampleProcessor:
 
         # --- Audio ---
         audio_tokens = sample["audio_tokens"].long()
+        if audio_tokens.dim() == 3:
+            audio_tokens = audio_tokens.squeeze(0)
 
         # Masking Logic
         if "clean_start_token_idx" in sample["label"]:
