@@ -258,6 +258,7 @@ class OmniVoice(PreTrainedModel):
         # Inference-only attributes (set by from_pretrained when not in train mode)
         self.text_tokenizer = None
         self.audio_tokenizer = None
+        self.vocoder = None  # BigVGAN instance for mel_mode
         self.duration_estimator = None
         self.sampling_rate = None
         self._asr_pipe = None
@@ -282,11 +283,22 @@ class OmniVoice(PreTrainedModel):
                 model.text_tokenizer = AutoTokenizer.from_pretrained(resolved_path)
 
                 if model.config.mel_mode:
-                    # MALLE-style mel mode: vocoder is BigVGAN, not a discrete
-                    # audio tokenizer. Load lazily via load_vocoder() if needed.
+                    # MALLE-style mel mode: BigVGAN is the vocoder.
                     model.audio_tokenizer = None
                     model.feature_extractor = None
-                    model.sampling_rate = None
+                    model.sampling_rate = 44100  # BigVGAN 44kHz
+                    bigvgan_path = kwargs.pop("bigvgan_path", "bigvgan/weights/44k")
+                    try:
+                        from bigvgan.bigvgan import BigVGAN as _BigVGAN
+
+                        _voc = _BigVGAN.from_pretrained(
+                            bigvgan_path, use_cuda_kernel=False, map_location="cpu"
+                        )
+                        _voc.remove_weight_norm()
+                        _voc = _voc.eval().to(model.device)
+                        model.vocoder = _voc
+                    except Exception as _e:
+                        logger.warning("BigVGAN could not be loaded (%s). Call load_vocoder() manually.", _e)
                 else:
                     audio_tokenizer_path = os.path.join(
                         resolved_path, "audio_tokenizer"
@@ -323,6 +335,27 @@ class OmniVoice(PreTrainedModel):
             logging.disable(_prev_disable)
 
         return model
+
+    # -------------------------------------------------------------------
+    # mel_mode helpers
+    # -------------------------------------------------------------------
+
+    @property
+    def _frame_rate(self) -> float:
+        """Audio frames per second (depends on mode)."""
+        if self.config.mel_mode:
+            return 44100 / 512  # BigVGAN 44kHz, hop_size=512 ≈ 86.13 Hz
+        return self.audio_tokenizer.config.frame_rate
+
+    def load_vocoder(self, bigvgan_path: str = "bigvgan/weights/44k"):
+        """Load (or reload) the BigVGAN vocoder for mel_mode inference."""
+        from bigvgan.bigvgan import BigVGAN as _BigVGAN
+
+        _voc = _BigVGAN.from_pretrained(
+            bigvgan_path, use_cuda_kernel=False, map_location="cpu"
+        )
+        _voc.remove_weight_norm()
+        self.vocoder = _voc.eval().to(self.device)
 
     # -------------------------------------------------------------------
     # ASR support (optional, for auto-transcription)
@@ -628,7 +661,9 @@ class OmniVoice(PreTrainedModel):
             ``soundfile.write("out.wav", audios[0], model.sampling_rate)``.
         """
 
-        if self.audio_tokenizer is None or self.text_tokenizer is None:
+        if self.text_tokenizer is None or (
+            not self.config.mel_mode and self.audio_tokenizer is None
+        ):
             raise RuntimeError(
                 "Model is not loaded with audio/text tokenizers. Make sure you "
                 "loaded the model with OmniVoice.from_pretrained()."
@@ -653,9 +688,7 @@ class OmniVoice(PreTrainedModel):
             duration=duration,
         )
 
-        short_idx, long_idx = full_task.get_indices(
-            gen_config, self.audio_tokenizer.config.frame_rate
-        )
+        short_idx, long_idx = full_task.get_indices(gen_config, self._frame_rate)
 
         results = [None] * full_task.batch_size
 
@@ -703,6 +736,11 @@ class OmniVoice(PreTrainedModel):
         Returns:
             A :class:`VoiceClonePrompt` that can be passed to :meth:`generate`.
         """
+        if self.config.mel_mode:
+            raise NotImplementedError(
+                "create_voice_clone_prompt() is not supported in mel_mode. "
+                "Pass ref_audio directly to generate() instead."
+            )
         if self.audio_tokenizer is None:
             raise RuntimeError(
                 "Audio tokenizer is not loaded. Make sure you loaded the model "
@@ -804,6 +842,34 @@ class OmniVoice(PreTrainedModel):
         Returns:
             Decoded and post-processed audio array of shape (T,).
         """
+        if self.config.mel_mode:
+            # tokens is mel: [T_frame, num_mels] or list of such tensors (chunked)
+            if self.vocoder is None:
+                raise RuntimeError(
+                    "BigVGAN vocoder is not loaded. Call model.load_vocoder() first."
+                )
+            voc_device = next(self.vocoder.parameters()).device
+
+            def _mel_to_wav(mel_t: torch.Tensor) -> np.ndarray:
+                # mel_t: [T_frame, num_mels] -> [1, num_mels, T_frame]
+                mel_in = mel_t.to(voc_device).T.unsqueeze(0)
+                with torch.inference_mode():
+                    wav = self.vocoder(mel_in)  # [1, 1, T_audio]
+                return wav[0, 0].cpu().numpy()
+
+            if isinstance(tokens, list):
+                chunk_audios = [_mel_to_wav(t) for t in tokens]
+                audio_waveform = cross_fade_chunks(chunk_audios, self.sampling_rate)
+            else:
+                audio_waveform = _mel_to_wav(tokens)[np.newaxis, :]  # [1, T]
+
+            audio_waveform = self._post_process_audio(
+                audio_waveform,
+                postprocess_output=gen_config.postprocess_output,
+                ref_rms=rms,
+            )
+            return audio_waveform.squeeze(0)
+
         tokenizer_device = self.audio_tokenizer.device
         if isinstance(tokens, list):
             chunk_audios = [
@@ -888,7 +954,7 @@ class OmniVoice(PreTrainedModel):
             avg_tokens_per_char = task.target_lens[i] / len(task.texts[i])
             text_chunk_len = int(
                 gen_config.audio_chunk_duration
-                * self.audio_tokenizer.config.frame_rate
+                * self._frame_rate
                 / avg_tokens_per_char
             )
             chunks = chunk_text_punctuation(
@@ -1088,7 +1154,7 @@ class OmniVoice(PreTrainedModel):
         # and compute speed ratio so chunked generation scales proportionally.
         speed_list: Optional[List[float]] = None
         if durations is not None:
-            frame_rate = self.audio_tokenizer.config.frame_rate
+            frame_rate = self._frame_rate
             speed_list = []
             for i in range(batch_size):
                 if durations[i] is not None:
@@ -1224,6 +1290,203 @@ class OmniVoice(PreTrainedModel):
             "audio_mask": cond_audio_mask,
         }
 
+    def _prepare_mel_inference_inputs(
+        self,
+        text: str,
+        num_target_frames: int,
+        lang: Optional[str] = None,
+        instruct: Optional[str] = None,
+    ):
+        """Build input tensors for one item in mel_mode inference.
+
+        Returns dict with keys:
+            input_ids: [1, 1, T_total]  (text IDs; 0 at audio positions)
+            audio_mask: [1, T_total]    (True at mel-frame positions)
+            mel_input: [1, T_total, num_mels]  (zeros; audio positions start masked)
+            mel_mask:  [1, T_total]     (True at audio positions to predict)
+        """
+        lang_str = lang if lang else "None"
+        instruct_str = instruct if instruct else "None"
+        style_text = f"<|lang_start|>{lang_str}<|lang_end|>"
+        style_text += f"<|instruct_start|>{instruct_str}<|instruct_end|>"
+
+        # Both return [1, seq_len]; index with [0] to get [seq_len] when assigning.
+        style_ids = self.text_tokenizer(style_text, return_tensors="pt").input_ids.to(
+            self.device
+        )  # [1, N_style]
+        wrapped = f"<|text_start|>{text}<|text_end|>"
+        text_ids = _tokenize_with_nonverbal_tags(wrapped, self.text_tokenizer).to(
+            self.device
+        )  # [1, N_text]
+
+        n_style = style_ids.size(1)
+        n_text = text_ids.size(1)
+        n_total = n_style + n_text + num_target_frames
+
+        input_ids = torch.zeros(1, 1, n_total, dtype=torch.long, device=self.device)
+        input_ids[0, 0, :n_style] = style_ids[0]
+        input_ids[0, 0, n_style : n_style + n_text] = text_ids[0]
+
+        audio_mask = torch.zeros(1, n_total, dtype=torch.bool, device=self.device)
+        audio_mask[0, n_style + n_text :] = True
+
+        mel_input = torch.zeros(
+            1, n_total, self.config.num_mels, dtype=torch.float32, device=self.device
+        )
+        mel_mask = audio_mask.clone()  # all audio positions start masked
+
+        return {
+            "input_ids": input_ids,
+            "audio_mask": audio_mask,
+            "mel_input": mel_input,
+            "mel_mask": mel_mask,
+            "n_prefix": n_style + n_text,
+        }
+
+    def _generate_iterative_mel(
+        self, task: GenerationTask, gen_config: OmniVoiceGenerationConfig
+    ) -> List[torch.Tensor]:
+        """N-step iterative mel decoding (MALLE-style MAR).
+
+        Returns:
+            List of mel tensors of shape (T_frame, num_mels) — one per input.
+        """
+        B = task.batch_size
+        use_cfg = gen_config.guidance_scale != 0.0
+
+        inputs_list = [
+            self._prepare_mel_inference_inputs(
+                task.texts[i],
+                task.target_lens[i],
+                task.langs[i],
+                task.instructs[i],
+            )
+            for i in range(B)
+        ]
+
+        c_lens = [inp["input_ids"].size(2) for inp in inputs_list]
+        t_lens = task.target_lens
+        max_c_len = max(c_lens)
+        max_t_len = max(t_lens)
+
+        # Allocate padded batch tensors (cond + uncond when CFG is on)
+        bsz = 2 * B if use_cfg else B
+
+        batch_input_ids = torch.zeros(
+            bsz, 1, max_c_len, dtype=torch.long, device=self.device
+        )
+        batch_audio_mask = torch.zeros(
+            bsz, max_c_len, dtype=torch.bool, device=self.device
+        )
+        batch_mel_input = torch.zeros(
+            bsz, max_c_len, self.config.num_mels, device=self.device
+        )
+        batch_mel_mask = torch.zeros(
+            bsz, max_c_len, dtype=torch.bool, device=self.device
+        )
+        batch_attn_mask = torch.zeros(
+            bsz, 1, max_c_len, max_c_len, dtype=torch.bool, device=self.device
+        )
+
+        for i, inp in enumerate(inputs_list):
+            c_len = c_lens[i]
+            t_len = t_lens[i]
+
+            # Cond row
+            batch_input_ids[i, :, :c_len] = inp["input_ids"]
+            batch_audio_mask[i, :c_len] = inp["audio_mask"][0]
+            batch_mel_input[i, :c_len] = inp["mel_input"][0]
+            batch_mel_mask[i, :c_len] = inp["mel_mask"][0]
+            batch_attn_mask[i, :, :c_len, :c_len] = True
+
+            if use_cfg:
+                # Uncond row: audio-only prefix (no text), same target length
+                batch_input_ids[B + i, :, :t_len] = 0
+                batch_audio_mask[B + i, :t_len] = True
+                batch_mel_input[B + i, :t_len] = inp["mel_input"][0, -t_len:]
+                batch_mel_mask[B + i, :t_len] = True
+                batch_attn_mask[B + i, :, :t_len, :t_len] = True
+                if max_c_len > t_len:
+                    pad_diag = torch.arange(t_len, max_c_len, device=self.device)
+                    batch_attn_mask[B + i, :, pad_diag, pad_diag] = True
+
+        # Current predicted mel frames (start all-zero / masked)
+        mel_out = torch.zeros(
+            B, max_t_len, self.config.num_mels, device=self.device
+        )
+
+        # Unmask schedule: uniform over steps
+        timesteps = _get_time_steps(
+            t_start=0.0,
+            t_end=1.0,
+            num_step=gen_config.num_step,
+            t_shift=gen_config.t_shift,
+        ).tolist()
+        schedules = []
+        for t_len in t_lens:
+            rem = t_len
+            sched = []
+            for step in range(gen_config.num_step):
+                num = (
+                    rem
+                    if step == gen_config.num_step - 1
+                    else min(
+                        math.ceil(t_len * (timesteps[step + 1] - timesteps[step])),
+                        rem,
+                    )
+                )
+                sched.append(int(num))
+                rem -= int(num)
+            schedules.append(sched)
+
+        for step in range(gen_config.num_step):
+            out = self(
+                input_ids=batch_input_ids,
+                audio_mask=batch_audio_mask,
+                attention_mask=batch_attn_mask,
+                mel_input=batch_mel_input,
+                mel_mask=batch_mel_mask,
+            )
+            # out.logits: [bsz, max_c_len, num_mels]
+
+            for i in range(B):
+                k = schedules[i][step]
+                if k <= 0:
+                    continue
+
+                c_len = c_lens[i]
+                t_len = t_lens[i]
+                n_prefix = inputs_list[i]["n_prefix"]
+
+                # Extract audio-position predictions from cond pass
+                c_pred = out.logits[i, n_prefix : n_prefix + t_len]  # [t_len, num_mels]
+
+                if use_cfg:
+                    u_pred = out.logits[B + i, :t_len]  # [t_len, num_mels]
+                    pred = c_pred + gen_config.guidance_scale * (c_pred - u_pred)
+                else:
+                    pred = c_pred
+
+                # Randomly select k still-masked frames
+                still_masked = batch_mel_mask[i, n_prefix : n_prefix + t_len]  # [t_len]
+                masked_indices = still_masked.nonzero(as_tuple=True)[0]
+                if masked_indices.numel() == 0:
+                    continue
+                k = min(k, masked_indices.numel())
+                chosen = masked_indices[
+                    torch.randperm(masked_indices.numel(), device=self.device)[:k]
+                ]
+
+                # Update mel_out and batch tensors
+                mel_out[i, chosen] = pred[chosen].to(mel_out.dtype)
+                batch_mel_input[i, n_prefix + chosen] = pred[chosen].to(mel_out.dtype)
+                batch_mel_mask[i, n_prefix + chosen] = False
+                if use_cfg:
+                    batch_mel_input[B + i, chosen] = pred[chosen].to(mel_out.dtype)
+                    batch_mel_mask[B + i, chosen] = False
+
+        return [mel_out[i, : t_lens[i]] for i in range(B)]
+
     def _generate_iterative(
         self, task: GenerationTask, gen_config: OmniVoiceGenerationConfig
     ) -> List[torch.Tensor]:
@@ -1238,6 +1501,8 @@ class OmniVoice(PreTrainedModel):
             List of generated audio token tensors of shape (C, T) (one per
             input text).
         """
+        if self.config.mel_mode:
+            return self._generate_iterative_mel(task, gen_config)
 
         B = task.batch_size
 
