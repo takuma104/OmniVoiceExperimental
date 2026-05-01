@@ -737,9 +737,8 @@ class OmniVoice(PreTrainedModel):
             A :class:`VoiceClonePrompt` that can be passed to :meth:`generate`.
         """
         if self.config.mel_mode:
-            raise NotImplementedError(
-                "create_voice_clone_prompt() is not supported in mel_mode. "
-                "Pass ref_audio directly to generate() instead."
+            return self._create_voice_clone_prompt_mel(
+                ref_audio, ref_text=ref_text, preprocess_prompt=preprocess_prompt
             )
         if self.audio_tokenizer is None:
             raise RuntimeError(
@@ -823,6 +822,89 @@ class OmniVoice(PreTrainedModel):
 
         return VoiceClonePrompt(
             ref_audio_tokens=ref_audio_tokens,
+            ref_text=ref_text,
+            ref_rms=ref_rms,
+        )
+
+    def _create_voice_clone_prompt_mel(
+        self,
+        ref_audio: Union[str, tuple[torch.Tensor, int]],
+        ref_text: Optional[str] = None,
+        preprocess_prompt: bool = True,
+    ) -> VoiceClonePrompt:
+        """Build a VoiceClonePrompt for mel_mode by computing the mel
+        spectrogram of the reference audio with BigVGAN-compatible hyper-params.
+
+        The resulting ``ref_audio_tokens`` field stores a [T_ref, num_mels]
+        mel tensor (instead of discrete codes) and is consumed downstream by
+        :meth:`_prepare_mel_inference_inputs`.
+        """
+        if self.vocoder is None:
+            raise RuntimeError(
+                "BigVGAN vocoder is not loaded. Call model.load_vocoder() "
+                "first; mel hyper-parameters are read from vocoder.h."
+            )
+
+        if isinstance(ref_audio, str):
+            ref_wav = load_audio(ref_audio, self.sampling_rate)
+        else:
+            waveform, sr = ref_audio
+            if isinstance(waveform, torch.Tensor):
+                waveform = waveform.cpu().numpy()
+            if waveform.ndim == 1:
+                waveform = waveform[np.newaxis, :]
+            if waveform.shape[0] > 1:
+                waveform = np.mean(waveform, axis=0, keepdims=True)
+            if sr != self.sampling_rate:
+                waveform = torchaudio.functional.resample(
+                    torch.from_numpy(waveform),
+                    orig_freq=sr,
+                    new_freq=self.sampling_rate,
+                ).numpy()
+            ref_wav = waveform
+
+        ref_rms = float(np.sqrt(np.mean(ref_wav**2)))
+        if 0 < ref_rms < 0.1:
+            ref_wav = ref_wav * 0.1 / ref_rms
+
+        if preprocess_prompt:
+            if ref_text is None:
+                ref_wav = trim_long_audio(
+                    ref_wav, self.sampling_rate, trim_threshold=20.0
+                )
+            ref_wav = remove_silence(
+                ref_wav,
+                self.sampling_rate,
+                mid_sil=200,
+                lead_sil=100,
+                trail_sil=200,
+            )
+            if ref_wav.shape[-1] == 0:
+                raise ValueError(
+                    "Reference audio is empty after silence removal. "
+                    "Try setting preprocess_prompt=False."
+                )
+
+        if ref_text is None:
+            if self._asr_pipe is None:
+                logger.info("ASR model not loaded yet, loading on-the-fly ...")
+                self.load_asr_model()
+            ref_text = self.transcribe((ref_wav, self.sampling_rate))
+            logger.debug("Auto-transcribed ref_text: %s", ref_text)
+
+        from bigvgan.meldataset import get_mel_spectrogram
+
+        wav_t = torch.from_numpy(ref_wav).float()
+        if wav_t.dim() == 1:
+            wav_t = wav_t.unsqueeze(0)
+        mel = get_mel_spectrogram(wav_t, self.vocoder.h)  # [1, M, T_ref]
+        ref_mel = mel.squeeze(0).transpose(0, 1).contiguous().to(self.device)
+
+        if preprocess_prompt:
+            ref_text = add_punctuation(ref_text)
+
+        return VoiceClonePrompt(
+            ref_audio_tokens=ref_mel,  # [T_ref, num_mels] in mel_mode
             ref_text=ref_text,
             ref_rms=ref_rms,
         )
@@ -1140,12 +1222,19 @@ class OmniVoice(PreTrainedModel):
             # to get the raw estimate, then override target_lens below.
             has_dur = durations is not None and durations[i] is not None
             item_speed = 1.0 if has_dur else (user_speed[i] if user_speed else 1.0)
+            if ref_audio_tokens_list[i] is not None:
+                # mel_mode stores [T_ref, num_mels]; discrete stores (C, T_ref).
+                num_ref = (
+                    ref_audio_tokens_list[i].size(0)
+                    if self.config.mel_mode
+                    else ref_audio_tokens_list[i].size(-1)
+                )
+            else:
+                num_ref = None
             est = self._estimate_target_tokens(
                 text_list[i],
                 ref_text_list[i],
-                ref_audio_tokens_list[i].size(-1)
-                if ref_audio_tokens_list[i] is not None
-                else None,
+                num_ref,
                 speed=item_speed,
             )
             num_target_tokens_list.append(est)
@@ -1296,51 +1385,68 @@ class OmniVoice(PreTrainedModel):
         num_target_frames: int,
         lang: Optional[str] = None,
         instruct: Optional[str] = None,
+        ref_text: Optional[str] = None,
+        ref_mel: Optional[torch.Tensor] = None,
     ):
         """Build input tensors for one item in mel_mode inference.
+
+        When ``ref_mel`` is provided, the audio region becomes
+        ``[ref_mel (unmasked) | target (masked)]`` and ``ref_text`` is
+        prepended to the text region — analogous to the discrete
+        voice-clone path.
 
         Returns dict with keys:
             input_ids: [1, 1, T_total]  (text IDs; 0 at audio positions)
             audio_mask: [1, T_total]    (True at mel-frame positions)
-            mel_input: [1, T_total, num_mels]  (zeros; audio positions start masked)
-            mel_mask:  [1, T_total]     (True at audio positions to predict)
+            mel_input: [1, T_total, num_mels]  (ref_mel at prompt; zeros at target)
+            mel_mask:  [1, T_total]     (True only at target positions)
+            n_prefix: int                index where the target region starts
         """
         lang_str = lang if lang else "None"
         instruct_str = instruct if instruct else "None"
         style_text = f"<|lang_start|>{lang_str}<|lang_end|>"
         style_text += f"<|instruct_start|>{instruct_str}<|instruct_end|>"
 
-        # Both return [1, seq_len]; index with [0] to get [seq_len] when assigning.
         style_ids = self.text_tokenizer(style_text, return_tensors="pt").input_ids.to(
             self.device
         )  # [1, N_style]
-        wrapped = f"<|text_start|>{text}<|text_end|>"
+        full_text = _combine_text(ref_text=ref_text, text=text)
+        wrapped = f"<|text_start|>{full_text}<|text_end|>"
         text_ids = _tokenize_with_nonverbal_tags(wrapped, self.text_tokenizer).to(
             self.device
         )  # [1, N_text]
 
         n_style = style_ids.size(1)
         n_text = text_ids.size(1)
-        n_total = n_style + n_text + num_target_frames
+        n_ref = ref_mel.size(0) if ref_mel is not None else 0
+        n_audio_start = n_style + n_text
+        n_target_start = n_audio_start + n_ref
+        n_total = n_target_start + num_target_frames
 
         input_ids = torch.zeros(1, 1, n_total, dtype=torch.long, device=self.device)
         input_ids[0, 0, :n_style] = style_ids[0]
-        input_ids[0, 0, n_style : n_style + n_text] = text_ids[0]
+        input_ids[0, 0, n_style:n_audio_start] = text_ids[0]
 
         audio_mask = torch.zeros(1, n_total, dtype=torch.bool, device=self.device)
-        audio_mask[0, n_style + n_text :] = True
+        audio_mask[0, n_audio_start:] = True
 
         mel_input = torch.zeros(
             1, n_total, self.config.num_mels, dtype=torch.float32, device=self.device
         )
-        mel_mask = audio_mask.clone()  # all audio positions start masked
+        if n_ref > 0:
+            mel_input[0, n_audio_start:n_target_start] = ref_mel.to(
+                device=self.device, dtype=mel_input.dtype
+            )
+
+        mel_mask = torch.zeros(1, n_total, dtype=torch.bool, device=self.device)
+        mel_mask[0, n_target_start:] = True
 
         return {
             "input_ids": input_ids,
             "audio_mask": audio_mask,
             "mel_input": mel_input,
             "mel_mask": mel_mask,
-            "n_prefix": n_style + n_text,
+            "n_prefix": n_target_start,
         }
 
     def _generate_iterative_mel(
@@ -1360,6 +1466,8 @@ class OmniVoice(PreTrainedModel):
                 task.target_lens[i],
                 task.langs[i],
                 task.instructs[i],
+                ref_text=task.ref_texts[i],
+                ref_mel=task.ref_audio_tokens[i],
             )
             for i in range(B)
         ]
