@@ -105,6 +105,38 @@ class OmniTrainer:
         self.global_step = 0
         self.epoch = 0
 
+        # Optional vocoder used for eval-time mel-sample logging.
+        self.vocoder = None
+        if (
+            getattr(self.config, "mel_mode", False)
+            and getattr(self.config, "eval_log_samples", 0) > 0
+            and self.accelerator.is_main_process
+        ):
+            self._load_vocoder_for_logging()
+
+    def _load_vocoder_for_logging(self):
+        weights_dir = getattr(self.config, "bigvgan_weights_dir", None)
+        if not weights_dir or not os.path.isdir(weights_dir):
+            logger.warning(
+                f"eval_log_samples > 0 but bigvgan_weights_dir is not a valid "
+                f"directory ({weights_dir!r}); mel-sample logging disabled."
+            )
+            return
+        try:
+            from bigvgan import BigVGAN
+
+            vocoder = BigVGAN.from_pretrained(weights_dir, use_cuda_kernel=False)
+            vocoder = vocoder.to(self.accelerator.device).eval()
+            vocoder.remove_weight_norm()
+            self.vocoder = vocoder
+            logger.info(
+                f"Loaded BigVGAN vocoder from {weights_dir} for eval logging."
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                f"Failed to load BigVGAN vocoder ({e}); mel-sample logging disabled."
+            )
+
     def _init_accelerator(self) -> Accelerator:
         """Initialize Accelerator, DeepSpeed, and Logging."""
         # TF32 setup
@@ -333,12 +365,23 @@ class OmniTrainer:
         local_loss_sum = torch.tensor(0.0, device=self.accelerator.device)
         eval_count = 0
 
+        log_samples = (
+            self.vocoder is not None
+            and self.accelerator.is_main_process
+            and getattr(self.config, "eval_log_samples", 0) > 0
+        )
+        first_batch = None
+        first_outputs = None
+
         with torch.no_grad():
             for eval_batch in self.eval_dataloader:
                 eval_batch = _to_device(eval_batch, self.accelerator.device)
                 outputs = self.model(**eval_batch)
                 local_loss_sum += outputs.loss.detach()
                 eval_count += 1
+                if log_samples and first_batch is None:
+                    first_batch = eval_batch
+                    first_outputs = outputs
 
         if eval_count > 0:
             local_mean = local_loss_sum / eval_count
@@ -352,9 +395,144 @@ class OmniTrainer:
         self.accelerator.log(eval_metrics, step=self.global_step)
         logger.info(f"Eval Loss: {final_eval_loss:.4f}")
 
+        if log_samples and first_batch is not None:
+            try:
+                self._log_mel_eval_samples(first_batch, first_outputs.logits)
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"Failed to log mel eval samples: {e}")
+
         self.accelerator.wait_for_everyone()
         self.model.train()
         return eval_metrics
+
+    def _log_mel_eval_samples(self, batch, mel_pred):
+        """Log mel-spectrogram images and vocoded audio for a few eval samples.
+
+        Splits the packed eval batch by ``document_ids`` and logs the first
+        ``eval_log_samples`` documents. For each document we log:
+          - target mel image
+          - "filled" mel image (target with masked positions replaced by pred)
+          - target audio (vocoded by BigVGAN)
+          - filled audio (vocoded by BigVGAN)
+        """
+        import io
+
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+        import numpy as np
+        from PIL import Image
+
+        document_ids = batch["document_ids"][0]  # [L]
+        audio_mask = batch["audio_mask"][0].bool()  # [L]
+        mel_target = batch["mel_target"][0]  # [L, M]
+        mel_mask = batch["mel_mask"][0].bool()  # [L]
+        pred = mel_pred[0]  # [L, M]
+
+        unique_docs = [d.item() for d in document_ids.unique() if d.item() != -1]
+        n = min(getattr(self.config, "eval_log_samples", 0), len(unique_docs))
+        if n == 0:
+            return
+
+        sr = int(getattr(self.config, "mel_sample_rate", 44100))
+        images = {}
+        audios = {}
+
+        for idx, doc_id in enumerate(unique_docs[:n]):
+            doc_sel = (document_ids == doc_id) & audio_mask
+            if doc_sel.sum().item() < 2:
+                continue
+            mel_t = mel_target[doc_sel].float()  # [T, M]
+            mel_p = pred[doc_sel].float()  # [T, M]
+            m_mask = mel_mask[doc_sel]  # [T]
+
+            mel_filled = mel_t.clone()
+            if m_mask.any():
+                mel_filled[m_mask] = mel_p[m_mask]
+
+            # --- Mel image: 2 stacked panels (target / filled-pred). ---
+            fig, axes = plt.subplots(2, 1, figsize=(10, 5), sharex=True)
+            t_np = mel_t.transpose(0, 1).cpu().numpy()
+            f_np = mel_filled.transpose(0, 1).cpu().numpy()
+            vmin = float(min(t_np.min(), f_np.min()))
+            vmax = float(max(t_np.max(), f_np.max()))
+            axes[0].imshow(
+                t_np, aspect="auto", origin="lower", vmin=vmin, vmax=vmax
+            )
+            axes[0].set_title(f"sample {idx} target (T={mel_t.shape[0]})")
+            axes[0].set_ylabel("mel bin")
+            axes[1].imshow(
+                f_np, aspect="auto", origin="lower", vmin=vmin, vmax=vmax
+            )
+            mask_pct = 100.0 * m_mask.float().mean().item()
+            axes[1].set_title(f"sample {idx} filled-pred (mask={mask_pct:.1f}%)")
+            axes[1].set_ylabel("mel bin")
+            axes[1].set_xlabel("frame")
+            fig.tight_layout()
+            buf = io.BytesIO()
+            fig.savefig(buf, format="png", dpi=100)
+            plt.close(fig)
+            buf.seek(0)
+            images[f"eval/mel_sample_{idx}"] = np.array(Image.open(buf))
+
+            # --- Vocode target and filled-pred. ---
+            with torch.no_grad():
+                voc_dtype = next(self.vocoder.parameters()).dtype
+                voc_device = next(self.vocoder.parameters()).device
+                wav_t = self.vocoder(
+                    mel_t.transpose(0, 1).unsqueeze(0).to(voc_device, voc_dtype)
+                )
+                wav_f = self.vocoder(
+                    mel_filled.transpose(0, 1).unsqueeze(0).to(voc_device, voc_dtype)
+                )
+            wav_t = wav_t.squeeze().float().cpu().numpy()
+            wav_f = wav_f.squeeze().float().cpu().numpy()
+            audios[f"eval/audio_sample_{idx}_target"] = wav_t
+            audios[f"eval/audio_sample_{idx}_pred"] = wav_f
+
+        if not images and not audios:
+            return
+
+        # Send to wandb tracker if available, otherwise fall back to disk dump.
+        tracker = None
+        try:
+            tracker = self.accelerator.get_tracker("wandb", unwrap=True)
+        except Exception:  # noqa: BLE001
+            tracker = None
+
+        if tracker is not None:
+            import wandb
+
+            payload = {}
+            for k, v in images.items():
+                payload[k] = wandb.Image(v)
+            for k, v in audios.items():
+                payload[k] = wandb.Audio(v, sample_rate=sr)
+            tracker.log(payload, step=self.global_step)
+        else:
+            # Fallback: dump under output_dir/eval_samples/step_{N}/
+            out_root = os.path.join(
+                self.config.output_dir,
+                "eval_samples",
+                f"step_{self.global_step}",
+            )
+            os.makedirs(out_root, exist_ok=True)
+            for k, v in images.items():
+                Image.fromarray(v).save(
+                    os.path.join(out_root, k.replace("/", "_") + ".png")
+                )
+            try:
+                import soundfile as sf
+
+                for k, v in audios.items():
+                    sf.write(
+                        os.path.join(out_root, k.replace("/", "_") + ".wav"),
+                        v,
+                        sr,
+                    )
+            except ImportError:
+                logger.warning("soundfile not available; skipping wav dump.")
 
     def train(self):
         """Main training loop."""

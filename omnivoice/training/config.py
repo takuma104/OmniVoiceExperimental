@@ -104,6 +104,13 @@ class TrainingConfig:
     save_steps: int = 10000
     keep_last_n_checkpoints: int = -1
 
+    # Eval-time mel sample logging (mel_mode only). When > 0, the trainer
+    # vocodes the first ``eval_log_samples`` documents from the first eval
+    # batch via BigVGAN at every eval step and logs mel images + audio to
+    # the active tracker (wandb / tensorboard).
+    eval_log_samples: int = 0
+    bigvgan_weights_dir: Optional[str] = None
+
     # Wandb
     use_wandb: bool = False
     wandb_project: str = "omnivoice"

@@ -44,6 +44,9 @@
     "save_steps": 10000,
     "keep_last_n_checkpoints": -1,
 
+    "eval_log_samples": 3,
+    "bigvgan_weights_dir": "bigvgan/weights/44k",
+
     "use_wandb": false,
     "wandb_project": "omnivoice-mel",
     "wandb_run_name": "mel-malle-style-run1"
