@@ -39,7 +39,10 @@ from transformers.trainer_utils import seed_worker
 from omnivoice.data.batching import PackingIterableDataset
 from omnivoice.data.collator import PackingDataCollator
 from omnivoice.data.dataset import WebDatasetReader, prepare_data_manifests_from_json
-from omnivoice.data.processor import OmniVoiceSampleProcessor
+from omnivoice.data.processor import (
+    OmniVoiceARSampleProcessor,
+    OmniVoiceSampleProcessor,
+)
 from omnivoice.models.omnivoice import OmniVoice, OmniVoiceConfig, _resolve_model_path
 from omnivoice.training.config import TrainingConfig
 
@@ -95,6 +98,8 @@ def build_model_and_tokenizer(
             num_audio_codebook=config.num_audio_codebook,
             audio_codebook_weights=config.audio_codebook_weights,
             llm_config=llm_config,
+            ar_mode=config.ar_mode,
+            audio_eos_id=config.audio_eos_id,
         )
 
         original_level = hf_logging.get_verbosity()
@@ -128,18 +133,31 @@ def build_dataloaders(
     """Setup Data Pipeline: Manifests -> WDS -> Packing -> Loaders."""
     logger.info("Initializing Data Readers...")
 
-    processor = OmniVoiceSampleProcessor(
-        text_tokenizer=tokenizer,
-        num_channels=config.num_audio_codebook,
-        audio_mask_id=config.audio_mask_id,
-        prompt_ratio_range=config.prompt_ratio_range,
-        mask_ratio_range=config.mask_ratio_range,
-        drop_cond_ratio=config.drop_cond_ratio,
-        language_ratio=config.language_ratio,
-        use_pinyin_ratio=config.use_pinyin_ratio,
-        instruct_ratio=config.instruct_ratio,
-        only_instruct_ratio=config.only_instruct_ratio,
-    )
+    if config.ar_mode:
+        processor = OmniVoiceARSampleProcessor(
+            text_tokenizer=tokenizer,
+            num_channels=config.num_audio_codebook,
+            audio_eos_id=config.audio_eos_id,
+            prompt_ratio_range=config.prompt_ratio_range,
+            drop_cond_ratio=config.drop_cond_ratio,
+            language_ratio=config.language_ratio,
+            use_pinyin_ratio=config.use_pinyin_ratio,
+            instruct_ratio=config.instruct_ratio,
+            only_instruct_ratio=config.only_instruct_ratio,
+        )
+    else:
+        processor = OmniVoiceSampleProcessor(
+            text_tokenizer=tokenizer,
+            num_channels=config.num_audio_codebook,
+            audio_mask_id=config.audio_mask_id,
+            prompt_ratio_range=config.prompt_ratio_range,
+            mask_ratio_range=config.mask_ratio_range,
+            drop_cond_ratio=config.drop_cond_ratio,
+            language_ratio=config.language_ratio,
+            use_pinyin_ratio=config.use_pinyin_ratio,
+            instruct_ratio=config.instruct_ratio,
+            only_instruct_ratio=config.only_instruct_ratio,
+        )
 
     train_manifests, dev_manifests = prepare_data_manifests_from_json(
         config.data_config

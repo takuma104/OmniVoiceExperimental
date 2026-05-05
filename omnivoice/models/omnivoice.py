@@ -165,6 +165,8 @@ class OmniVoiceConfig(PretrainedConfig):
         num_audio_codebook: int = 8,
         audio_codebook_weights: Optional[list[float]] = None,
         llm_config: Optional[Union[dict, PretrainedConfig]] = None,
+        ar_mode: bool = False,
+        audio_eos_id: int = 1024,
         **kwargs,
     ):
 
@@ -180,6 +182,8 @@ class OmniVoiceConfig(PretrainedConfig):
         if audio_codebook_weights is None:
             audio_codebook_weights = [8, 8, 6, 6, 4, 4, 2, 2]
         self.audio_codebook_weights = audio_codebook_weights
+        self.ar_mode = ar_mode
+        self.audio_eos_id = audio_eos_id
 
 
 def _resolve_model_path(name_or_path: str) -> str:
@@ -385,10 +389,13 @@ class OmniVoice(PreTrainedModel):
         inputs_embeds = self._prepare_embed_inputs(input_ids, audio_mask)
 
         if attention_mask is None and document_ids is not None:
+            mask_fn = (
+                _get_packed_causal_mask(document_ids[0].to(inputs_embeds.device))
+                if getattr(self.config, "ar_mode", False)
+                else _get_packed_mask(document_ids[0].to(inputs_embeds.device))
+            )
             attention_mask = create_block_mask(
-                _get_packed_mask(
-                    document_ids[0].to(inputs_embeds.device),
-                ),
+                mask_fn,
                 B=None,
                 H=None,
                 Q_LEN=input_ids.size(-1),
@@ -566,7 +573,7 @@ class OmniVoice(PreTrainedModel):
 
         if short_idx:
             short_task = full_task.slice_task(short_idx)
-            short_results = self._generate_iterative(short_task, gen_config)
+            short_results = self._generate_core(short_task, gen_config)
             for idx, res in zip(short_idx, short_results):
                 results[idx] = res
 
@@ -837,7 +844,7 @@ class OmniVoice(PreTrainedModel):
                 ref_rms=[task.ref_rms[i] for i in indices],
                 speed=[task.speed[i] for i in indices] if task.speed else None,
             )
-            gen_tokens = self._generate_iterative(sub_task, gen_config)
+            gen_tokens = self._generate_core(sub_task, gen_config)
             for j, idx in enumerate(indices):
                 chunk_results[idx].append(gen_tokens[j])
 
@@ -1129,6 +1136,117 @@ class OmniVoice(PreTrainedModel):
             "audio_mask": cond_audio_mask,
         }
 
+    def _generate_core(
+        self, task: GenerationTask, gen_config: OmniVoiceGenerationConfig
+    ) -> List[torch.Tensor]:
+        """Dispatch to AR or NAR core decoder based on ``config.ar_mode``."""
+        if getattr(self.config, "ar_mode", False):
+            return self._generate_ar(task, gen_config)
+        return self._generate_iterative(task, gen_config)
+
+    def _generate_ar(
+        self, task: GenerationTask, gen_config: OmniVoiceGenerationConfig
+    ) -> List[torch.Tensor]:
+        """Pure-AR token-by-token decoding (one item at a time, no KV cache).
+
+        The prefix is ``[style][text][ref_audio?]`` (built by
+        :meth:`_prepare_inference_inputs` with ``num_target_tokens=0``). At
+        each step we forward the full sequence, take logits at the last
+        position, sample 8 codebook tokens in parallel, and append them.
+        Stops when codebook 0 emits ``audio_eos_id`` or when ``target_lens``
+        is reached. Classifier-free guidance is applied when a reference
+        audio is available (the unconditional branch keeps only the ref
+        audio prefix).
+        """
+        results: List[torch.Tensor] = []
+        for i in range(task.batch_size):
+            logger.debug(
+                "AR item %d — text: %s | ref_text: %s | instruct: %s | lang: %s | max_target_tokens: %d",
+                i,
+                task.texts[i],
+                task.ref_texts[i],
+                task.instructs[i],
+                task.langs[i],
+                task.target_lens[i],
+            )
+            results.append(self._generate_ar_single(task, i, gen_config))
+        return results
+
+    def _generate_ar_single(
+        self, task: GenerationTask, i: int, gen_config: OmniVoiceGenerationConfig
+    ) -> torch.Tensor:
+        cond_inputs = self._prepare_inference_inputs(
+            text=task.texts[i],
+            num_target_tokens=0,
+            ref_text=task.ref_texts[i],
+            ref_audio_tokens=task.ref_audio_tokens[i],
+            lang=task.langs[i],
+            instruct=task.instructs[i],
+            denoise=gen_config.denoise,
+        )
+        cond_input_ids = cond_inputs["input_ids"]  # [1, C, L_cond]
+        cond_audio_mask = cond_inputs["audio_mask"]  # [1, L_cond]
+
+        ref_tokens = task.ref_audio_tokens[i]
+        if ref_tokens is not None:
+            uncond_input_ids = ref_tokens.unsqueeze(0).to(self.device)  # [1, C, L_ref]
+            uncond_audio_mask = torch.ones(
+                (1, uncond_input_ids.size(-1)), dtype=torch.bool, device=self.device
+            )
+            use_cfg = gen_config.guidance_scale != 0
+        else:
+            uncond_input_ids = None
+            uncond_audio_mask = None
+            use_cfg = False
+
+        max_target = task.target_lens[i]
+        eos_id = self.config.audio_eos_id
+
+        gen_tokens = torch.empty(
+            (self.config.num_audio_codebook, 0),
+            dtype=torch.long,
+            device=self.device,
+        )
+
+        while gen_tokens.size(-1) < max_target:
+            cond_full, cond_mask_full = _append_audio(
+                cond_input_ids, cond_audio_mask, gen_tokens
+            )
+            out_c = self(input_ids=cond_full, audio_mask=cond_mask_full)
+            logits_c = out_c.logits[:, :, -1, :].to(torch.float32)  # [1, C, V]
+
+            if use_cfg:
+                uncond_full, uncond_mask_full = _append_audio(
+                    uncond_input_ids, uncond_audio_mask, gen_tokens
+                )
+                out_u = self(input_ids=uncond_full, audio_mask=uncond_mask_full)
+                logits_u = out_u.logits[:, :, -1, :].to(torch.float32)
+                log_p_c = F.log_softmax(logits_c, dim=-1)
+                log_p_u = F.log_softmax(logits_u, dim=-1)
+                log_probs = torch.log_softmax(
+                    log_p_c + gen_config.guidance_scale * (log_p_c - log_p_u),
+                    dim=-1,
+                )
+            else:
+                log_probs = F.log_softmax(logits_c, dim=-1)
+
+            if gen_config.class_temperature > 0.0:
+                filtered = _filter_top_k(log_probs, ratio=0.1)
+                next_tokens = _gumbel_sample(
+                    filtered, gen_config.class_temperature
+                ).argmax(dim=-1)  # [1, C]
+            else:
+                next_tokens = log_probs.argmax(dim=-1)  # [1, C]
+
+            # Codebook 0 EOS terminates generation.
+            if next_tokens[0, 0].item() == eos_id:
+                break
+
+            new_col = next_tokens.squeeze(0).unsqueeze(-1)  # [C, 1]
+            gen_tokens = torch.cat([gen_tokens, new_col], dim=-1)
+
+        return gen_tokens
+
     def _generate_iterative(
         self, task: GenerationTask, gen_config: OmniVoiceGenerationConfig
     ) -> List[torch.Tensor]:
@@ -1326,6 +1444,18 @@ def _mask_mod_packed(document_ids, b, h, q_idx, kv_idx):
     return same_doc
 
 
+def _get_packed_causal_mask(document_ids):
+    return partial(_mask_mod_packed_causal, document_ids)
+
+
+def _mask_mod_packed_causal(document_ids, b, h, q_idx, kv_idx):
+    # AR variant: same-document AND causal (q can only attend to <= kv positions
+    # within the same document).
+    same_doc = document_ids[q_idx] == document_ids[kv_idx]
+    causal = q_idx >= kv_idx
+    return same_doc & causal
+
+
 def _resolve_language(language: Optional[str]) -> Union[str, None]:
     from omnivoice.utils.lang_map import LANG_IDS, LANG_NAME_TO_ID
 
@@ -1476,6 +1606,29 @@ def _resolve_instruct(
     separator = "，" if has_zh else ", "
 
     return separator.join(normalised)
+
+
+def _append_audio(
+    prefix_ids: torch.Tensor,
+    prefix_mask: torch.Tensor,
+    gen_tokens: torch.Tensor,
+):
+    """Append generated audio tokens to a prefix (input_ids, audio_mask)."""
+    if gen_tokens.size(-1) == 0:
+        return prefix_ids, prefix_mask
+    full_ids = torch.cat([prefix_ids, gen_tokens.unsqueeze(0)], dim=2)
+    full_mask = torch.cat(
+        [
+            prefix_mask,
+            torch.ones(
+                (1, gen_tokens.size(-1)),
+                dtype=torch.bool,
+                device=prefix_mask.device,
+            ),
+        ],
+        dim=1,
+    )
+    return full_ids, full_mask
 
 
 def _filter_top_k(logits: torch.Tensor, ratio: float = 0.1) -> torch.Tensor:

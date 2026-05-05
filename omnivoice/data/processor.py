@@ -174,6 +174,147 @@ class OmniVoiceSampleProcessor:
         return return_dict
 
 
+class OmniVoiceARSampleProcessor:
+    """
+    Pure-AR variant of :class:`OmniVoiceSampleProcessor`.
+
+    Mirrors the conditioning logic (style/text/prompt construction, drop_cond,
+    language/instruct/pinyin sampling) of the NAR processor, but instead of
+    random masking it produces:
+
+      - ``audio_inputs`` = full teacher-forced audio tokens with an EOS frame
+        appended on every codebook.
+      - ``labels``       = next-token labels obtained by left-shifting
+        ``input_ids`` by one position. Loss is only computed on positions
+        whose *next* token falls inside the target audio range (i.e. after
+        any prompt audio); all other positions are set to ``-100``.
+
+    The slot at ``audio_eos_id`` is the same slot used as ``audio_mask_id``
+    in NAR; the embedding/head shapes are unchanged.
+    """
+
+    def __init__(
+        self,
+        text_tokenizer: Any,
+        num_channels: int,
+        audio_eos_id: int,
+        prompt_ratio_range: tuple,
+        drop_cond_ratio: float,
+        language_ratio: float,
+        use_pinyin_ratio: float,
+        instruct_ratio: float,
+        only_instruct_ratio: float,
+    ):
+        self.text_tokenizer = text_tokenizer
+        self.num_channels = num_channels
+        self.audio_eos_id = audio_eos_id
+        self.prompt_ratio_range = prompt_ratio_range
+        self.drop_cond_ratio = drop_cond_ratio
+
+        self.language_ratio = language_ratio
+        self.use_pinyin_ratio = use_pinyin_ratio
+        self.instruct_ratio = instruct_ratio
+        self.only_instruct_ratio = only_instruct_ratio
+
+    def __call__(self, sample: Dict[str, Any]) -> Dict[str, Any]:
+
+        if "clean_start_token_idx" in sample["label"]:
+            drop_cond = False
+        else:
+            drop_cond = random.uniform(0, 1) < self.drop_cond_ratio
+
+        if drop_cond:
+            prompt_ratio = 0.0
+            drop_text = True
+            use_language = False
+            use_instruct = False
+        else:
+            prompt_ratio = random.uniform(*self.prompt_ratio_range)
+            drop_text = False
+            use_language = random.uniform(0, 1) < self.language_ratio
+            use_instruct = random.uniform(0, 1) < self.instruct_ratio
+            if use_instruct and random.uniform(0, 1) < self.only_instruct_ratio:
+                prompt_ratio = 0.0
+
+        # --- Style ---
+        style = ""
+        language = sample["label"].get("language_id", "None") if use_language else "None"
+        instruct = sample["label"].get("instruct", "None") if use_instruct else "None"
+
+        if "clean_start_token_idx" in sample["label"]:
+            style += "<|denoise|>"
+
+        style += f"<|lang_start|>{language}<|lang_end|>"
+        style += f"<|instruct_start|>{instruct}<|instruct_end|>"
+
+        style_inputs = self.text_tokenizer(style, return_tensors="pt").input_ids.repeat(
+            self.num_channels, 1
+        )
+
+        # --- Text ---
+        if (
+            "text_pinyin" in sample["label"]
+            and random.uniform(0, 1) < self.use_pinyin_ratio
+        ):
+            text = sample["label"]["text_pinyin"]
+        else:
+            text = sample["label"]["text"]
+        text_inputs = self.text_tokenizer(
+            f"<|text_start|>{text}<|text_end|>", return_tensors="pt"
+        ).input_ids.repeat(self.num_channels, 1)
+
+        # --- Audio (teacher forcing + EOS frame) ---
+        audio_tokens = sample["audio_tokens"].long()
+        if audio_tokens.dim() == 3:
+            audio_tokens = audio_tokens.squeeze(0)
+
+        if "clean_start_token_idx" in sample["label"]:
+            prompt_length = sample["label"]["clean_start_token_idx"]
+        else:
+            prompt_length = int(audio_tokens.shape[1] * prompt_ratio)
+
+        eos_frame = torch.full(
+            (self.num_channels, 1), self.audio_eos_id, dtype=audio_tokens.dtype
+        )
+        audio_inputs = torch.cat([audio_tokens, eos_frame], dim=1)  # [C, T_audio + 1]
+
+        # --- Concatenation & left-shift labels ---
+        if drop_text:
+            input_ids = audio_inputs
+            total_length = input_ids.shape[1]
+            audio_mask = torch.ones(total_length, dtype=torch.bool)
+
+            labels = torch.full_like(input_ids, -100)
+            # Predict next audio token everywhere except the final EOS position.
+            labels[:, :-1] = input_ids[:, 1:]
+        else:
+            input_ids = torch.cat([style_inputs, text_inputs, audio_inputs], dim=1)
+            total_length = input_ids.shape[1]
+
+            audio_start_idx = style_inputs.shape[1] + text_inputs.shape[1]
+            audio_end_idx = audio_start_idx + audio_inputs.shape[1]  # exclusive
+
+            audio_mask = torch.zeros(total_length, dtype=torch.bool)
+            audio_mask[audio_start_idx:] = True
+
+            labels = torch.full_like(input_ids, -100)
+            # Loss positions p satisfy: input_ids[:, p+1] is the next token to
+            # predict, and p+1 must lie inside the target audio range
+            # (i.e. after any prompt audio, including the EOS frame).
+            loss_start = audio_start_idx + prompt_length - 1
+            loss_end = audio_end_idx - 1  # exclusive
+            if loss_end > max(loss_start, 0):
+                lo = max(loss_start, 0)
+                labels[:, lo:loss_end] = input_ids[:, lo + 1 : loss_end + 1]
+
+        return {
+            "input_ids": input_ids,  # [C, L]
+            "labels": labels,  # [C, L]
+            "audio_mask": audio_mask,  # [L]
+            "length": total_length,
+        }
+
+
 class OmniVoiceSimpleSampleProcessor:
     """
     Handles the logic of processing a raw sample into tensors

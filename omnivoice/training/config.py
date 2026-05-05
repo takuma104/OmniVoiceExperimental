@@ -35,9 +35,14 @@ class TrainingConfig:
 
     # Model Specific
     llm_name_or_path: str = "Qwen/Qwen3-0.6B"
-    audio_vocab_size: int = 1025  # valid vocab size + 1 (mask token)
+    audio_vocab_size: int = 1025  # valid vocab size + 1 (mask token in NAR / EOS in AR)
     audio_mask_id: int = 1024  # 1024 is the 1025-th token
     num_audio_codebook: int = 8
+
+    # AR mode: pure autoregressive training (causal attention, next-token loss).
+    # When True, the slot at audio_mask_id is reused as the audio EOS token.
+    ar_mode: bool = False
+    audio_eos_id: int = 1024
 
     # Model Training Specific
     audio_codebook_weights: List[float | int] = field(
