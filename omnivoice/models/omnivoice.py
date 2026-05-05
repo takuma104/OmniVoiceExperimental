@@ -101,6 +101,9 @@ class OmniVoiceGenerationConfig:
     postprocess_output: bool = True
     audio_chunk_duration: float = 15.0
     audio_chunk_threshold: float = 30.0
+    # AR-only: minimum new audio frames before EOS is allowed.
+    # 0 means "auto" (max(target_lens // 2, 25)).
+    min_new_tokens: int = 0
 
     @classmethod
     def from_dict(cls, kwargs_dict):
@@ -1202,6 +1205,17 @@ class OmniVoice(PreTrainedModel):
         max_target = task.target_lens[i]
         eos_id = self.config.audio_eos_id
 
+        # Minimum new tokens before EOS is allowed. Two reasons:
+        # 1. Audio decoder needs a minimum input length (conv kernels >= 7),
+        #    so an empty/very short generation crashes downstream.
+        # 2. Early in training the model can spuriously prefer EOS at the
+        #    first step under greedy decoding; we force it to commit to
+        #    enough frames before honouring EOS.
+        if gen_config.min_new_tokens > 0:
+            min_new = min(gen_config.min_new_tokens, max_target)
+        else:
+            min_new = min(max(max_target // 2, 25), max_target)
+
         gen_tokens = torch.empty(
             (self.config.num_audio_codebook, 0),
             dtype=torch.long,
@@ -1230,6 +1244,9 @@ class OmniVoice(PreTrainedModel):
             else:
                 log_probs = F.log_softmax(logits_c, dim=-1)
 
+            if gen_tokens.size(-1) < min_new:
+                log_probs[..., eos_id] = -float("inf")
+
             if gen_config.class_temperature > 0.0:
                 filtered = _filter_top_k(log_probs, ratio=0.1)
                 next_tokens = _gumbel_sample(
@@ -1240,6 +1257,12 @@ class OmniVoice(PreTrainedModel):
 
             # Codebook 0 EOS terminates generation.
             if next_tokens[0, 0].item() == eos_id:
+                logger.debug(
+                    "AR: EOS at frame %d/%d (min_new=%d)",
+                    gen_tokens.size(-1),
+                    max_target,
+                    min_new,
+                )
                 break
 
             new_col = next_tokens.squeeze(0).unsqueeze(-1)  # [C, 1]
