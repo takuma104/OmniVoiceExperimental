@@ -102,8 +102,14 @@ class OmniVoiceGenerationConfig:
     audio_chunk_duration: float = 15.0
     audio_chunk_threshold: float = 30.0
     # AR-only: minimum new audio frames before EOS is allowed.
-    # 0 means "auto" (max(target_lens // 2, 25)).
+    # 0 means "auto" (max(duration_estimate // 4, 25)).
     min_new_tokens: int = 0
+    # AR-only: upper bound on generated frames is
+    # ``ceil(duration_estimate * ar_max_tokens_factor)``. The duration
+    # estimator is a rough heuristic (built for NAR's fixed-length output),
+    # so AR needs headroom to let EOS terminate naturally. Set to 1.0 to
+    # enforce the heuristic length as a hard cap (NAR-like behaviour).
+    ar_max_tokens_factor: float = 3.0
 
     @classmethod
     def from_dict(cls, kwargs_dict):
@@ -1202,7 +1208,14 @@ class OmniVoice(PreTrainedModel):
             uncond_audio_mask = None
             use_cfg = False
 
-        max_target = task.target_lens[i]
+        # The duration estimator is built for NAR's fixed-length output and
+        # tends to underestimate, especially in auto-voice mode where it
+        # falls back to a short English ref. Treat it as a hint and expand
+        # the upper bound by ``ar_max_tokens_factor`` so EOS can terminate
+        # naturally.
+        duration_estimate = task.target_lens[i]
+        factor = max(gen_config.ar_max_tokens_factor, 1.0)
+        max_target = max(int(duration_estimate * factor), duration_estimate)
         eos_id = self.config.audio_eos_id
 
         # Minimum new tokens before EOS is allowed. Two reasons:
@@ -1211,10 +1224,12 @@ class OmniVoice(PreTrainedModel):
         # 2. Early in training the model can spuriously prefer EOS at the
         #    first step under greedy decoding; we force it to commit to
         #    enough frames before honouring EOS.
+        # We base the auto floor on the (un-scaled) duration estimate so a
+        # memorized model can still terminate close to the heuristic length.
         if gen_config.min_new_tokens > 0:
             min_new = min(gen_config.min_new_tokens, max_target)
         else:
-            min_new = min(max(max_target // 2, 25), max_target)
+            min_new = min(max(duration_estimate // 4, 25), max_target)
 
         gen_tokens = torch.empty(
             (self.config.num_audio_codebook, 0),
