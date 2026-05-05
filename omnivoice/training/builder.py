@@ -88,6 +88,26 @@ def build_model_and_tokenizer(
             dtype=torch.float32,
             train=True,
         )
+        if model.config.audio_vocab_size != config.audio_vocab_size:
+            raise ValueError(
+                "audio_vocab_size in the checkpoint "
+                f"({model.config.audio_vocab_size}) does not match training config "
+                f"({config.audio_vocab_size})."
+            )
+        if model.config.num_audio_codebook != config.num_audio_codebook:
+            raise ValueError(
+                "num_audio_codebook in the checkpoint "
+                f"({model.config.num_audio_codebook}) does not match training config "
+                f"({config.num_audio_codebook})."
+            )
+        model.config.ar_mode = config.ar_mode
+        model.config.audio_eos_id = config.audio_eos_id
+        model.config.audio_mask_id = config.audio_mask_id
+        model.config.audio_codebook_weights = config.audio_codebook_weights
+        model.normalized_audio_codebook_weights = [
+            w / sum(config.audio_codebook_weights)
+            for w in config.audio_codebook_weights
+        ]
     else:
         resolved_llm = _resolve_model_path(config.llm_name_or_path)
         llm_config = AutoConfig.from_pretrained(resolved_llm)
