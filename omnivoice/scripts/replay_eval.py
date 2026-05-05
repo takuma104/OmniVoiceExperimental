@@ -110,6 +110,7 @@ def _decode_tokens(model: OmniVoice, tokens: torch.Tensor) -> np.ndarray:
     wav = (
         model.audio_tokenizer.decode(tokens.to(tokenizer_device).unsqueeze(0))
         .audio_values[0]
+        .detach()
         .cpu()
         .numpy()
     )
