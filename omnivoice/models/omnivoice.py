@@ -1244,8 +1244,15 @@ class OmniVoice(PreTrainedModel):
             else:
                 log_probs = F.log_softmax(logits_c, dim=-1)
 
+            # Only codebook 0 may emit EOS. Codebooks 1..C-1 must always
+            # produce a valid (non-EOS) audio token, otherwise the EOS slot
+            # (= audio_mask_id at index audio_vocab_size - 1) would be fed
+            # to the audio decoder as a real token and trigger an
+            # out-of-range embedding lookup.
+            log_probs[:, 1:, eos_id] = -float("inf")
+
             if gen_tokens.size(-1) < min_new:
-                log_probs[..., eos_id] = -float("inf")
+                log_probs[:, 0, eos_id] = -float("inf")
 
             if gen_config.class_temperature > 0.0:
                 filtered = _filter_top_k(log_probs, ratio=0.1)
