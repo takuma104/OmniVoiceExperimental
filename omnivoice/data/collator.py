@@ -90,3 +90,67 @@ class PackingDataCollator:
         return_list["document_ids"] = document_ids.unsqueeze(0)  # [1, L]
 
         return return_list
+
+
+class ASRPackingDataCollator:
+    """Packing collator for OmniVoice ASR batches.
+
+    Unlike TTS training, ASR labels are text-token labels with shape ``[L]``
+    rather than per-codebook audio labels with shape ``[C, L]``.
+    """
+
+    def __init__(self, processor, batch_tokens: int):
+        self.batch_tokens = batch_tokens
+        self.processor = processor
+
+    def __call__(self, processed_samples: List[Dict[str, Any]]) -> Dict[str, Any]:
+        target_length = self.batch_tokens
+
+        input_ids = torch.cat([s["input_ids"] for s in processed_samples], dim=1)
+        labels = torch.cat([s["labels"] for s in processed_samples], dim=0)
+        audio_mask = torch.cat([s["audio_mask"] for s in processed_samples], dim=0)
+        text_causal_mask = torch.cat(
+            [s["text_causal_mask"] for s in processed_samples], dim=0
+        )
+
+        position_ids = torch.cat(
+            [torch.arange(s["length"], dtype=torch.long) for s in processed_samples],
+            dim=0,
+        )
+
+        pad_length = target_length - input_ids.shape[1]
+
+        input_ids = torch.nn.functional.pad(
+            input_ids,
+            pad=(0, pad_length),
+            value=self.processor.text_tokenizer.pad_token_id,
+        )
+        labels = torch.nn.functional.pad(labels, pad=(0, pad_length), value=-100)
+        audio_mask = torch.nn.functional.pad(
+            audio_mask, pad=(0, pad_length), value=False
+        )
+        text_causal_mask = torch.nn.functional.pad(
+            text_causal_mask, pad=(0, pad_length), value=False
+        )
+        position_ids = torch.nn.functional.pad(
+            position_ids, pad=(0, pad_length), value=0
+        )
+
+        document_ids_list = []
+        for i, s in enumerate(processed_samples):
+            seq_len = s["length"]
+            document_ids_list.append(torch.full((seq_len,), i, dtype=torch.int32))
+
+        document_ids = torch.cat(document_ids_list, dim=0)
+        document_ids = torch.nn.functional.pad(
+            document_ids, pad=(0, pad_length), value=-1
+        )
+
+        return {
+            "input_ids": input_ids.unsqueeze(0),  # [1, C, L]
+            "labels": labels.unsqueeze(0),  # [1, L]
+            "audio_mask": audio_mask.unsqueeze(0),  # [1, L]
+            "text_causal_mask": text_causal_mask.unsqueeze(0),  # [1, L]
+            "position_ids": position_ids.unsqueeze(0),  # [1, L]
+            "document_ids": document_ids.unsqueeze(0),  # [1, L]
+        }

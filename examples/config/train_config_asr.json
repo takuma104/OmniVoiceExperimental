@@ -1,0 +1,41 @@
+{
+    "llm_name_or_path": "Qwen/Qwen3-0.6B",
+    "audio_vocab_size": 1025,
+    "audio_mask_id": 1024,
+    "num_audio_codebook": 8,
+
+    "audio_codebook_weights": [8, 8, 6, 6, 4, 4, 2, 2],
+    "language_ratio": 1.0,
+
+    "resume_from_checkpoint": null,
+    "init_from_checkpoint": "k2-fsa/OmniVoice",
+    "asr_qwen3_model_path": "Qwen/Qwen3-0.6B",
+    "asr_init_from_asr_checkpoint": null,
+    "asr_codebook_mode": "all_sum",
+    "asr_attention_mode": "prefix_lm",
+    "asr_train_llm_body": true,
+    "asr_freeze_text_embedding": true,
+    "asr_freeze_text_head": true,
+    "asr_freeze_audio_embeddings": true,
+
+    "learning_rate": 1e-5,
+    "weight_decay": 0.01,
+    "max_grad_norm": 1.0,
+    "steps": 5000,
+    "seed": 42,
+    "warmup_type": "ratio",
+    "warmup_ratio": 0.03,
+    "warmup_steps": 0,
+
+    "batch_tokens": 8192,
+    "gradient_accumulation_steps": 1,
+    "num_workers": 2,
+
+    "mixed_precision": "bf16",
+    "allow_tf32": true,
+
+    "logging_steps": 50,
+    "eval_steps": 500,
+    "save_steps": 500,
+    "keep_last_n_checkpoints": -1
+}

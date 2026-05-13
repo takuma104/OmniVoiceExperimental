@@ -55,6 +55,16 @@ class TrainingConfig:
     resume_from_checkpoint: Optional[str] = None
     init_from_checkpoint: Optional[str] = None
 
+    # ASR settings
+    asr_qwen3_model_path: str = "Qwen/Qwen3-0.6B"
+    asr_init_from_asr_checkpoint: Optional[str] = None
+    asr_codebook_mode: str = "all_sum"
+    asr_attention_mode: str = "prefix_lm"
+    asr_train_llm_body: bool = True
+    asr_freeze_text_embedding: bool = True
+    asr_freeze_text_head: bool = True
+    asr_freeze_audio_embeddings: bool = True
+
     # Training Hyperparams
     learning_rate: float = 1e-4
     weight_decay: float = 0.01

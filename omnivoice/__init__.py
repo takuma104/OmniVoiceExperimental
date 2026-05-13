@@ -24,5 +24,11 @@ from omnivoice.models.omnivoice import (
     OmniVoiceConfig,
     OmniVoiceGenerationConfig,
 )
+from omnivoice.models.omnivoice_asr import OmniVoiceForSpeechRecognition
 
-__all__ = ["OmniVoice", "OmniVoiceConfig", "OmniVoiceGenerationConfig"]
+__all__ = [
+    "OmniVoice",
+    "OmniVoiceConfig",
+    "OmniVoiceGenerationConfig",
+    "OmniVoiceForSpeechRecognition",
+]

@@ -258,3 +258,69 @@ class OmniVoiceSimpleSampleProcessor:
         }
 
         return return_dict
+
+
+class OmniVoiceASRSampleProcessor:
+    """Prepare OmniVoice codec tokens for autoregressive ASR training."""
+
+    def __init__(
+        self,
+        text_tokenizer: Any,
+        num_channels: int,
+        language_ratio: float = 1.0,
+    ):
+        self.text_tokenizer = text_tokenizer
+        self.num_channels = num_channels
+        self.language_ratio = language_ratio
+
+    def __call__(self, sample: Dict[str, Any]) -> Dict[str, Any]:
+        label = sample["label"]
+        use_language = random.uniform(0, 1) < self.language_ratio
+
+        style = "<|asr|>"
+        if use_language:
+            language = label.get("language_id", "None")
+            style += f"<|lang_start|>{language}<|lang_end|>"
+
+        style_ids = self.text_tokenizer(style, return_tensors="pt").input_ids
+        style_inputs = style_ids.repeat(self.num_channels, 1)
+
+        audio_tokens = sample["audio_tokens"].long()
+        if audio_tokens.dim() == 3:
+            audio_tokens = audio_tokens.squeeze(0)
+        if audio_tokens.size(0) != self.num_channels:
+            raise ValueError(
+                f"Expected {self.num_channels} audio codebooks, "
+                f"got {audio_tokens.size(0)}"
+            )
+
+        text = label["text"]
+        text_ids = self.text_tokenizer(
+            f"<|text_start|>{text}<|text_end|>", return_tensors="pt"
+        ).input_ids
+        text_inputs = text_ids.repeat(self.num_channels, 1)
+
+        input_ids = torch.cat([style_inputs, audio_tokens, text_inputs], dim=1)
+        total_length = input_ids.shape[1]
+        audio_start_idx = style_inputs.shape[1]
+        audio_end_idx = audio_start_idx + audio_tokens.shape[1]
+        text_start_idx = audio_end_idx
+
+        audio_mask = torch.zeros(total_length, dtype=torch.bool)
+        audio_mask[audio_start_idx:audio_end_idx] = True
+
+        text_causal_mask = torch.zeros(total_length, dtype=torch.bool)
+        text_causal_mask[text_start_idx:] = True
+
+        labels = torch.full((total_length,), -100, dtype=torch.long)
+        # The first text token is <|text_start|>. It is an input prompt token;
+        # following text positions are predicted autoregressively.
+        labels[text_start_idx + 1 :] = text_ids.squeeze(0)[1:]
+
+        return {
+            "input_ids": input_ids,  # [C, L]
+            "labels": labels,  # [L]
+            "audio_mask": audio_mask,  # [L]
+            "text_causal_mask": text_causal_mask,  # [L]
+            "length": total_length,
+        }

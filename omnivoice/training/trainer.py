@@ -398,10 +398,16 @@ class OmniTrainer:
 
             batch = _to_device(batch, self.accelerator.device)
 
-            non_padding = (batch["document_ids"] != -1).squeeze(0)  # [L]
-            audio_mask = batch["audio_mask"].squeeze(0).bool()  # [L]
-            logging_audio_tokens += (non_padding & audio_mask).sum().item()
-            logging_text_tokens += (non_padding & ~audio_mask).sum().item()
+            if "document_ids" in batch and "audio_mask" in batch:
+                non_padding = (batch["document_ids"] != -1).squeeze(0)  # [L]
+                audio_mask = batch["audio_mask"].squeeze(0).bool()  # [L]
+                logging_audio_tokens += (non_padding & audio_mask).sum().item()
+
+                labels = batch.get("labels")
+                if isinstance(labels, torch.Tensor) and labels.dim() == 2:
+                    logging_text_tokens += (labels != -100).sum().item()
+                else:
+                    logging_text_tokens += (non_padding & ~audio_mask).sum().item()
 
             with self.accelerator.accumulate(self.model):
                 outputs = self.model(**batch)
