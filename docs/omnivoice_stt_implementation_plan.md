@@ -4,7 +4,7 @@
 
 OmniVoice の既存 TTS checkpoint を土台に、音声 token から transcript text token を自己回帰生成する STT/ASR モデルを実装する。
 
-Qwen3-TTS で確認できた「speech prefix を与え、LLM body のみを学習して STT 化する」方針を OmniVoice に移植する。ただし OmniVoice は Higgs Audio の 8 codebook を直接扱う single-stage NAR TTS であり、codebook0 が Qwen3-TTS のような semantic 専用 codebook である保証は弱い。そのため、最初の本命実験は all-codebook 入力とし、codebook0-only は ablation として扱う。
+Qwen3-TTS で確認できた「speech prefix を与え、LLM body のみを学習して STT 化する」方針を OmniVoice に移植する。ただし OmniVoice は Higgs Audio の 8 codebook を直接扱う single-stage NAR TTS であり、8 codebook は acoustic token 群として扱うのが自然である。そのため、STT 入力も既存 OmniVoice と同じく all-codebook embedding sum を標準方針にする。
 
 ## 前提
 
@@ -88,13 +88,12 @@ shifted_ids = audio_tokens + codebook_layer_offsets
 audio_embeds = audio_embeddings(shifted_ids).sum(dim=1)
 ```
 
-初期実験は all-codebook 入力を推奨する。
+STT でも all 8 codebooks を常に入力する。Qwen3-TTS でも単一 semantic codebook 入力より全 codebook embedding の sum の方が性能が出たため、OmniVoice では all-codebook 入力のみを標準実験にする。
 
-比較用 ablation:
+必要になった場合の比較候補:
 
-- all 8 codebooks
-- codebook0 only
-- codebook0 + learnable adapter over codebooks
+- all-codebook embedding sum
+- all-codebook embedding sum + small adapter
 - codebook weighted sum
 
 ## Attention mask
@@ -210,8 +209,7 @@ asr_freeze_text_embedding: bool = True
 asr_freeze_text_head: bool = True
 asr_freeze_audio_embeddings: bool = True
 asr_train_llm_body: bool = True
-asr_use_all_codebooks: bool = True
-asr_codebook_mode: str = "all_sum"  # "all_sum" | "codebook0"
+asr_codebook_mode: str = "all_sum"
 asr_attention_mode: str = "prefix_lm"
 ```
 
@@ -255,8 +253,8 @@ LR はまず `1e-5` から始め、loss が動きにくい場合に `2e-5` か�
 6. `train_asr.py` または `task="asr"` branch を追加する。
 7. 100 sample 程度で overfit test を行う。
 8. greedy generation API を追加する。
-9. all-codebook と codebook0-only の ablation を行う。
-10. text_head frozen / trainable、audio_embeddings frozen / trainable を比較する。
+9. text_head frozen / trainable、audio_embeddings frozen / trainable を比較する。
+10. 必要に応じて all-codebook sum + adapter などの入力表現を比較する。
 
 ## 評価
 
@@ -274,17 +272,17 @@ LR はまず `1e-5` から始め、loss が動きにくい場合に `2e-5` か�
 - language 別 CER/WER
 - duration bucket 別 CER/WER
 - 数字・固有名詞・句読点の誤り
-- codebook mode 別比較
+- all-codebook 入力表現別比較
 
 推奨比較:
 
 | 実験 | 入力 | trainable | head |
 | --- | --- | --- | --- |
-| A | all codebooks | LLM body only | frozen |
-| B | codebook0 only | LLM body only | frozen |
-| C | all codebooks | LLM body + text_head | trainable |
-| D | all codebooks | LoRA only | frozen |
-| E | all codebooks | LLM body + audio_embeddings | frozen head |
+| A | all-codebook sum | LLM body only | frozen |
+| B | all-codebook sum | LLM body + text_head | trainable |
+| C | all-codebook sum | LoRA only | frozen |
+| D | all-codebook sum | LLM body + audio_embeddings | frozen head |
+| E | all-codebook sum + adapter | LLM body only | frozen |
 
 ## STS を見据えた設計
 
@@ -343,14 +341,14 @@ ASR と STS で processor を分けすぎると後で統合が難しくなるた
 
 ## リスク
 
-### codebook0 が semantic 専用ではない
+### Acoustic codebook 入力の情報量
 
-Qwen3-TTS と異なり、OmniVoice の Higgs Audio codebook0 だけで transcript 情報が十分とは限らない。
+OmniVoice の Higgs Audio 8 codebook は acoustic token 群として扱う。STT では transcript に直接関係する情報だけでなく、音素・発音・曖昧音・固有名詞などの復元に acoustic residual 情報が効く可能性が高い。
 
 対策:
 
-- 初期本命は all-codebook。
-- codebook0-only は比較実験にする。
+- 既存 OmniVoice と同じ all-codebook embedding sum を標準入力にする。
+- 入力側の自由度を増やしたい場合は codebook 削減ではなく、all-codebook sum 後の adapter や codebook weighting を検討する。
 
 ### NAR body を AR text generation に使う mismatch
 
@@ -394,7 +392,7 @@ LLM body を ASR に full fine-tune すると、既存 TTS 能力が落ちる可
 
 - all-codebook 入力で meaningful な transcription が出る。
 - LLM body-only training で dev CER/WER が継続的に改善する。
-- codebook0-only と all-codebook の差分が測れる。
+- all-codebook sum で安定して学習できる。
 
 実用化判断:
 
