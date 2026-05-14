@@ -38,6 +38,7 @@ class OmniVoiceForSpeechRecognition(PreTrainedModel):
 
     _supports_flex_attn = True
     _supports_flash_attn_2 = True
+    _supports_sdpa = True
     config_class = OmniVoiceConfig
 
     def __init__(
@@ -190,7 +191,19 @@ class OmniVoiceForSpeechRecognition(PreTrainedModel):
         document_ids: torch.Tensor,
         text_causal_mask: torch.Tensor,
         device: torch.device,
+        dtype: torch.dtype,
     ):
+        attn_implementation = getattr(self.llm.config, "_attn_implementation", None)
+        if attn_implementation != "flex_attention":
+            return self._build_dense_prefix_lm_mask(
+                input_ids=input_ids,
+                document_ids=document_ids,
+                text_causal_mask=text_causal_mask,
+                device=device,
+                dtype=dtype,
+                as_attention_bias=attn_implementation == "eager",
+            )
+
         return create_block_mask(
             _get_asr_prefix_lm_mask(
                 document_ids[0].to(device),
@@ -203,6 +216,44 @@ class OmniVoiceForSpeechRecognition(PreTrainedModel):
             _compile=True,
             device=device,
         )
+
+    def _build_dense_prefix_lm_mask(
+        self,
+        input_ids: torch.Tensor,
+        document_ids: torch.Tensor,
+        text_causal_mask: torch.Tensor,
+        device: torch.device,
+        dtype: torch.dtype,
+        as_attention_bias: bool = False,
+    ):
+        document_ids = document_ids.to(device)
+        text_causal_mask = text_causal_mask.to(device=device, dtype=torch.bool)
+        if document_ids.ndim == 1:
+            document_ids = document_ids.unsqueeze(0)
+        if text_causal_mask.ndim == 1:
+            text_causal_mask = text_causal_mask.unsqueeze(0)
+
+        seq_len = input_ids.size(-1)
+        q_idx = torch.arange(seq_len, device=device).view(1, seq_len, 1)
+        kv_idx = torch.arange(seq_len, device=device).view(1, 1, seq_len)
+
+        same_doc = document_ids[:, :, None] == document_ids[:, None, :]
+        valid_doc = document_ids[:, :, None] >= 0
+        kv_is_prefix = ~text_causal_mask[:, None, :]
+        q_is_text = text_causal_mask[:, :, None]
+        causal_text = q_is_text & (q_idx >= kv_idx)
+        attention_mask = valid_doc & same_doc & (kv_is_prefix | causal_text)
+        attention_mask = attention_mask.unsqueeze(1)
+
+        if as_attention_bias:
+            min_dtype = torch.finfo(dtype).min
+            return torch.where(
+                attention_mask,
+                torch.tensor(0.0, dtype=dtype, device=device),
+                torch.tensor(min_dtype, dtype=dtype, device=device),
+            )
+
+        return attention_mask
 
     def forward(
         self,
@@ -226,6 +277,7 @@ class OmniVoiceForSpeechRecognition(PreTrainedModel):
                 document_ids=document_ids,
                 text_causal_mask=text_causal_mask,
                 device=inputs_embeds.device,
+                dtype=inputs_embeds.dtype,
             )
 
         llm_outputs = self.llm(

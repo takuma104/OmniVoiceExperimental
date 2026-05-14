@@ -31,6 +31,20 @@ def _resolve_dtype(dtype: str, device: str):
     raise ValueError(f"Unsupported dtype: {dtype}")
 
 
+def _get_best_device() -> str:
+    if torch.cuda.is_available():
+        return "cuda"
+    if torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
+def _resolve_attn_implementation(attn_implementation: str, device: str) -> str:
+    if attn_implementation != "auto":
+        return attn_implementation
+    return "flex_attention" if device.startswith("cuda") else "sdpa"
+
+
 def _normalize_text(text: str) -> str:
     text = text.strip().lower()
     text = re.sub(r"\s+", " ", text)
@@ -91,7 +105,6 @@ def _iter_samples(data_lst: str) -> Iterable[dict]:
 
 
 def evaluate(args):
-    patch_flex_attention_for_sm12()
     logging.basicConfig(
         format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
         level=logging.INFO,
@@ -99,20 +112,31 @@ def evaluate(args):
 
     device = args.device
     if device == "auto":
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+        device = _get_best_device()
     dtype = _resolve_dtype(args.dtype, device)
+    attn_implementation = _resolve_attn_implementation(
+        args.attn_implementation,
+        device,
+    )
+    if attn_implementation == "flex_attention":
+        patch_flex_attention_for_sm12()
 
     if device == "cpu":
         logger.warning(
-            "CPU evaluation may be very slow and may not support flex attention "
-            "on all torch versions."
+            "CPU evaluation may be very slow."
         )
 
-    logger.info("Loading checkpoint: %s", args.checkpoint)
+    logger.info(
+        "Loading checkpoint: %s (device=%s, dtype=%s, attn_implementation=%s)",
+        args.checkpoint,
+        device,
+        dtype,
+        attn_implementation,
+    )
     tokenizer = AutoTokenizer.from_pretrained(args.checkpoint)
     model = OmniVoiceForSpeechRecognition.from_pretrained(
         args.checkpoint,
-        attn_implementation="flex_attention",
+        attn_implementation=attn_implementation,
         dtype=dtype,
     )
     model.to(device)
@@ -248,7 +272,13 @@ def main():
     parser.add_argument(
         "--device",
         default="auto",
-        help="auto, cuda, cuda:0, cpu, etc.",
+        help="auto, cuda, cuda:0, mps, cpu, etc.",
+    )
+    parser.add_argument(
+        "--attn_implementation",
+        default="auto",
+        choices=["auto", "flex_attention", "sdpa", "eager"],
+        help="Attention implementation. auto uses flex_attention on CUDA and sdpa elsewhere.",
     )
     parser.add_argument(
         "--dtype",

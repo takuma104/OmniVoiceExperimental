@@ -193,6 +193,7 @@ def _resolve_model_path(name_or_path: str) -> str:
 class OmniVoice(PreTrainedModel):
     _supports_flex_attn = True
     _supports_flash_attn_2 = True
+    _supports_sdpa = True
     config_class = OmniVoiceConfig
 
     def __init__(self, config: OmniVoiceConfig, llm: Optional[PreTrainedModel] = None):
@@ -385,17 +386,31 @@ class OmniVoice(PreTrainedModel):
         inputs_embeds = self._prepare_embed_inputs(input_ids, audio_mask)
 
         if attention_mask is None and document_ids is not None:
-            attention_mask = create_block_mask(
-                _get_packed_mask(
-                    document_ids[0].to(inputs_embeds.device),
-                ),
-                B=None,
-                H=None,
-                Q_LEN=input_ids.size(-1),
-                KV_LEN=input_ids.size(-1),
-                _compile=True,
-                device=inputs_embeds.device,
+            attn_implementation = getattr(
+                self.llm.config,
+                "_attn_implementation",
+                None,
             )
+            if attn_implementation == "flex_attention":
+                attention_mask = create_block_mask(
+                    _get_packed_mask(
+                        document_ids[0].to(inputs_embeds.device),
+                    ),
+                    B=None,
+                    H=None,
+                    Q_LEN=input_ids.size(-1),
+                    KV_LEN=input_ids.size(-1),
+                    _compile=True,
+                    device=inputs_embeds.device,
+                )
+            else:
+                attention_mask = self._build_dense_packed_mask(
+                    input_ids=input_ids,
+                    document_ids=document_ids,
+                    device=inputs_embeds.device,
+                    dtype=inputs_embeds.dtype,
+                    as_attention_bias=attn_implementation == "eager",
+                )
 
         llm_outputs = self.llm(
             inputs_embeds=inputs_embeds,
@@ -446,6 +461,32 @@ class OmniVoice(PreTrainedModel):
             loss=loss,
             logits=audio_logits,
         )
+
+    def _build_dense_packed_mask(
+        self,
+        input_ids: torch.Tensor,
+        document_ids: torch.Tensor,
+        device: torch.device,
+        dtype: torch.dtype,
+        as_attention_bias: bool = False,
+    ):
+        document_ids = document_ids.to(device)
+        if document_ids.ndim == 1:
+            document_ids = document_ids.unsqueeze(0)
+
+        seq_len = input_ids.size(-1)
+        attention_mask = document_ids[:, :, None] == document_ids[:, None, :]
+        attention_mask = attention_mask[:, None, :seq_len, :seq_len]
+
+        if as_attention_bias:
+            min_dtype = torch.finfo(dtype).min
+            return torch.where(
+                attention_mask,
+                torch.tensor(0.0, dtype=dtype, device=device),
+                torch.tensor(min_dtype, dtype=dtype, device=device),
+            )
+
+        return attention_mask
 
     def supported_language_ids(self) -> set[str]:
         """Return a list of supported language IDs."""
