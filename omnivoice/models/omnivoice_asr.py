@@ -45,6 +45,8 @@ class OmniVoiceForSpeechRecognition(PreTrainedModel):
         self,
         config: OmniVoiceConfig,
         omnivoice: Optional[OmniVoice] = None,
+        audio_embedding_mode: Optional[str] = None,
+        audio_adapter_hidden_size: Optional[int] = None,
     ):
         super().__init__(config)
         self.all_tied_weights_keys = {}
@@ -52,6 +54,45 @@ class OmniVoiceForSpeechRecognition(PreTrainedModel):
         hidden_size = self.config.llm_config.hidden_size
         vocab_size = self.config.llm_config.vocab_size
         self.text_head = nn.Linear(hidden_size, vocab_size, bias=False)
+        self.audio_embedding_mode = (
+            audio_embedding_mode
+            or getattr(self.config, "asr_audio_embedding_mode", "all_sum")
+        )
+        self.config.asr_audio_embedding_mode = self.audio_embedding_mode
+        if audio_adapter_hidden_size is None:
+            audio_adapter_hidden_size = getattr(
+                self.config, "asr_audio_adapter_hidden_size", None
+            )
+
+        if self.audio_embedding_mode not in {
+            "all_sum",
+            "all_sum_adapter",
+            "weighted_sum",
+        }:
+            raise ValueError(
+                "Unsupported ASR audio embedding mode: "
+                f"{self.audio_embedding_mode!r}"
+            )
+
+        if self.audio_embedding_mode == "all_sum_adapter":
+            adapter_hidden = audio_adapter_hidden_size or hidden_size
+            self.config.asr_audio_adapter_hidden_size = adapter_hidden
+            self.audio_embedding_adapter = nn.Sequential(
+                nn.LayerNorm(hidden_size),
+                nn.Linear(hidden_size, adapter_hidden),
+                nn.GELU(),
+                nn.Linear(adapter_hidden, hidden_size),
+            )
+        else:
+            self.config.asr_audio_adapter_hidden_size = audio_adapter_hidden_size
+            self.audio_embedding_adapter = None
+
+        if self.audio_embedding_mode == "weighted_sum":
+            self.audio_codebook_weights = nn.Parameter(
+                torch.ones(self.config.num_audio_codebook)
+            )
+        else:
+            self.audio_codebook_weights = None
 
     @property
     def llm(self):
@@ -71,15 +112,6 @@ class OmniVoiceForSpeechRecognition(PreTrainedModel):
 
     def set_input_embeddings(self, value):
         self.omnivoice.set_input_embeddings(value)
-
-    @classmethod
-    def from_omnivoice_pretrained(cls, pretrained_model_name_or_path: str, **kwargs):
-        base = OmniVoice.from_pretrained(
-            pretrained_model_name_or_path,
-            train=True,
-            **kwargs,
-        )
-        return cls(config=base.config, omnivoice=base)
 
     def resize_text_vocab(self, vocab_size: int):
         """Resize LLM input embeddings and the ASR text head together."""
@@ -161,6 +193,7 @@ class OmniVoiceForSpeechRecognition(PreTrainedModel):
         freeze_text_embedding: bool = True,
         freeze_text_head: bool = True,
         freeze_audio_embeddings: bool = True,
+        train_audio_embedding_adapter: bool = True,
     ):
         for p in self.parameters():
             p.requires_grad = False
@@ -181,9 +214,61 @@ class OmniVoiceForSpeechRecognition(PreTrainedModel):
             for p in self.audio_embeddings.parameters():
                 p.requires_grad = True
 
+        if train_audio_embedding_adapter:
+            if self.audio_embedding_adapter is not None:
+                for p in self.audio_embedding_adapter.parameters():
+                    p.requires_grad = True
+            if self.audio_codebook_weights is not None:
+                self.audio_codebook_weights.requires_grad = True
+
         # The TTS audio heads are not used by ASR.
         for p in self.audio_heads.parameters():
             p.requires_grad = False
+
+    @classmethod
+    def from_omnivoice_pretrained(
+        cls,
+        pretrained_model_name_or_path: str,
+        audio_embedding_mode: Optional[str] = None,
+        audio_adapter_hidden_size: Optional[int] = None,
+        **kwargs,
+    ):
+        base = OmniVoice.from_pretrained(
+            pretrained_model_name_or_path,
+            train=True,
+            **kwargs,
+        )
+        return cls(
+            config=base.config,
+            omnivoice=base,
+            audio_embedding_mode=audio_embedding_mode,
+            audio_adapter_hidden_size=audio_adapter_hidden_size,
+        )
+
+    def _prepare_embed_inputs(
+        self, input_ids: torch.Tensor, audio_mask: torch.Tensor
+    ) -> torch.Tensor:
+        """Prepare mixed text/audio embeddings for ASR.
+
+        ``all_sum`` matches OmniVoice's native audio embedding path. The
+        adapter and weighted modes keep the codec embedding table shared and
+        only change how per-codebook embeddings are combined.
+        """
+        text_embeds = self.get_input_embeddings()(input_ids[:, 0, :])
+        shifted_ids = (
+            input_ids * audio_mask.unsqueeze(1)
+        ) + self.omnivoice.codebook_layer_offsets.view(1, -1, 1)
+        per_codebook_embeds = self.audio_embeddings(shifted_ids)
+
+        if self.audio_embedding_mode == "weighted_sum":
+            weights = self.audio_codebook_weights.to(dtype=per_codebook_embeds.dtype)
+            audio_embeds = (per_codebook_embeds * weights.view(1, -1, 1, 1)).sum(dim=1)
+        else:
+            audio_embeds = per_codebook_embeds.sum(dim=1)
+            if self.audio_embedding_adapter is not None:
+                audio_embeds = audio_embeds + self.audio_embedding_adapter(audio_embeds)
+
+        return torch.where(audio_mask.unsqueeze(-1), audio_embeds, text_embeds)
 
     def _build_prefix_lm_mask(
         self,
@@ -265,7 +350,7 @@ class OmniVoiceForSpeechRecognition(PreTrainedModel):
         position_ids: Optional[torch.LongTensor] = None,
         text_causal_mask: Optional[torch.Tensor] = None,
     ):
-        inputs_embeds = self.omnivoice._prepare_embed_inputs(input_ids, audio_mask)
+        inputs_embeds = self._prepare_embed_inputs(input_ids, audio_mask)
 
         if (
             attention_mask is None

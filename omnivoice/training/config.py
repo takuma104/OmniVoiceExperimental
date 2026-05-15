@@ -59,6 +59,9 @@ class TrainingConfig:
     asr_qwen3_model_path: str = "Qwen/Qwen3-0.6B"
     asr_init_from_asr_checkpoint: Optional[str] = None
     asr_codebook_mode: str = "all_sum"
+    asr_audio_embedding_mode: str = "all_sum"
+    asr_audio_adapter_hidden_size: Optional[int] = None
+    asr_train_audio_embedding_adapter: bool = True
     asr_attention_mode: str = "prefix_lm"
     asr_train_llm_body: bool = True
     asr_freeze_text_embedding: bool = True

@@ -92,9 +92,9 @@ STT でも all 8 codebooks を常に入力する。Qwen3-TTS でも単一 semant
 
 必要になった場合の比較候補:
 
-- all-codebook embedding sum
-- all-codebook embedding sum + small adapter
-- codebook weighted sum
+- all-codebook embedding sum: `asr_audio_embedding_mode="all_sum"`
+- all-codebook embedding sum + small adapter: `asr_audio_embedding_mode="all_sum_adapter"`
+- codebook weighted sum: `asr_audio_embedding_mode="weighted_sum"`。各 codebook weight は 1.0 初期化なので、初期状態は通常の sum と同じ。
 
 ## Attention mask
 
@@ -210,6 +210,9 @@ asr_freeze_text_head: bool = True
 asr_freeze_audio_embeddings: bool = True
 asr_train_llm_body: bool = True
 asr_codebook_mode: str = "all_sum"
+asr_audio_embedding_mode: str = "all_sum"  # "all_sum" | "all_sum_adapter" | "weighted_sum"
+asr_audio_adapter_hidden_size: Optional[int] = None
+asr_train_audio_embedding_adapter: bool = True
 asr_attention_mode: str = "prefix_lm"
 ```
 
@@ -229,6 +232,7 @@ ASR 専用 entrypoint に分ける場合:
   "llm_name_or_path": "Qwen/Qwen3-0.6B",
   "asr_qwen3_model_path": "Qwen/Qwen3-0.6B",
   "asr_codebook_mode": "all_sum",
+  "asr_audio_embedding_mode": "all_sum",
   "asr_attention_mode": "prefix_lm",
   "asr_freeze_text_embedding": true,
   "asr_freeze_text_head": true,

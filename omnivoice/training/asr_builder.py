@@ -62,6 +62,16 @@ def build_asr_model_and_tokenizer(
             "Only all-codebook embedding sum is supported for OmniVoice ASR. "
             f"Got asr_codebook_mode={config.asr_codebook_mode!r}."
         )
+    if config.asr_audio_embedding_mode not in {
+        "all_sum",
+        "all_sum_adapter",
+        "weighted_sum",
+    }:
+        raise ValueError(
+            "Unsupported ASR audio embedding mode: "
+            f"{config.asr_audio_embedding_mode!r}. Expected one of "
+            "'all_sum', 'all_sum_adapter', or 'weighted_sum'."
+        )
     if config.asr_attention_mode != "prefix_lm":
         raise ValueError(
             "Only prefix_lm attention is supported for OmniVoice ASR. "
@@ -80,6 +90,8 @@ def build_asr_model_and_tokenizer(
         logger.info("Loading OmniVoice base weights from %s", config.init_from_checkpoint)
         model = OmniVoiceForSpeechRecognition.from_omnivoice_pretrained(
             config.init_from_checkpoint,
+            audio_embedding_mode=config.asr_audio_embedding_mode,
+            audio_adapter_hidden_size=config.asr_audio_adapter_hidden_size,
             attn_implementation="flex_attention",
             dtype=torch.float32,
         )
@@ -106,6 +118,8 @@ def build_asr_model_and_tokenizer(
         model = OmniVoiceForSpeechRecognition(
             config=ov_config,
             omnivoice=OmniVoice(config=ov_config, llm=llm),
+            audio_embedding_mode=config.asr_audio_embedding_mode,
+            audio_adapter_hidden_size=config.asr_audio_adapter_hidden_size,
         )
 
     model.resize_text_vocab(len(tokenizer))
@@ -121,6 +135,7 @@ def build_asr_model_and_tokenizer(
         freeze_text_embedding=config.asr_freeze_text_embedding,
         freeze_text_head=config.asr_freeze_text_head,
         freeze_audio_embeddings=config.asr_freeze_audio_embeddings,
+        train_audio_embedding_adapter=config.asr_train_audio_embedding_adapter,
     )
 
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
