@@ -26,6 +26,7 @@ logger = logging.getLogger(__name__)
 class OmniVoiceASROutput(ModelOutput):
     loss: Optional[torch.Tensor] = None
     logits: Optional[torch.Tensor] = None
+    past_key_values: Optional[object] = None
 
 
 class OmniVoiceForSpeechRecognition(PreTrainedModel):
@@ -264,6 +265,8 @@ class OmniVoiceForSpeechRecognition(PreTrainedModel):
         document_ids: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
         text_causal_mask: Optional[torch.Tensor] = None,
+        past_key_values: Optional[object] = None,
+        use_cache: Optional[bool] = None,
     ):
         inputs_embeds = self.omnivoice._prepare_embed_inputs(input_ids, audio_mask)
 
@@ -285,6 +288,8 @@ class OmniVoiceForSpeechRecognition(PreTrainedModel):
             attention_mask=attention_mask,
             return_dict=True,
             position_ids=position_ids,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
         )
         hidden_states = llm_outputs[0]
         logits = self.text_head(hidden_states)
@@ -299,7 +304,11 @@ class OmniVoiceForSpeechRecognition(PreTrainedModel):
                 ignore_index=-100,
             )
 
-        return OmniVoiceASROutput(loss=loss, logits=logits)
+        return OmniVoiceASROutput(
+            loss=loss,
+            logits=logits,
+            past_key_values=getattr(llm_outputs, "past_key_values", None),
+        )
 
     @torch.inference_mode()
     def generate_text(
@@ -309,6 +318,7 @@ class OmniVoiceForSpeechRecognition(PreTrainedModel):
         language: Optional[str] = None,
         max_new_tokens: int = 256,
         temperature: float = 0.0,
+        use_cache: bool = True,
     ) -> str:
         """Simple non-KV cached greedy/sampling ASR generation helper."""
         if audio_tokens.dim() == 3 and audio_tokens.size(0) != 1:
@@ -322,6 +332,7 @@ class OmniVoiceForSpeechRecognition(PreTrainedModel):
             languages=[language],
             max_new_tokens=max_new_tokens,
             temperature=temperature,
+            use_cache=use_cache,
         )[0]
 
     @torch.inference_mode()
@@ -333,6 +344,7 @@ class OmniVoiceForSpeechRecognition(PreTrainedModel):
         audio_lengths: Optional[Union[torch.Tensor, Sequence[int]]] = None,
         max_new_tokens: int = 256,
         temperature: float = 0.0,
+        use_cache: bool = True,
     ) -> List[str]:
         """Batched non-KV cached greedy/sampling ASR generation helper.
 
@@ -345,6 +357,7 @@ class OmniVoiceForSpeechRecognition(PreTrainedModel):
             audio_lengths: Optional valid audio lengths for padded tensor input.
             max_new_tokens: Maximum number of text tokens to generate.
             temperature: ``0`` for greedy decoding, otherwise sampling temperature.
+            use_cache: Whether to use the LLM KV cache after the audio prefill.
         """
         device = next(self.parameters()).device
         c = self.config.num_audio_codebook
@@ -444,6 +457,83 @@ class OmniVoiceForSpeechRecognition(PreTrainedModel):
             position_ids[idx, :length] = torch.arange(length, device=device)
 
         lengths_tensor = torch.tensor(lengths, dtype=torch.long, device=device)
+        prompt_valid_mask = document_ids >= 0
+
+        if use_cache:
+            try:
+                return self._generate_text_batch_with_cache(
+                    input_ids=input_ids,
+                    audio_mask=audio_mask,
+                    text_causal_mask=text_causal_mask,
+                    document_ids=document_ids,
+                    position_ids=position_ids,
+                    prompt_valid_mask=prompt_valid_mask,
+                    lengths_tensor=lengths_tensor,
+                    tokenizer=tokenizer,
+                    eos_id=eos_id,
+                    max_new_tokens=max_new_tokens,
+                    temperature=temperature,
+                )
+            except Exception as exc:
+                if not getattr(self, "_warned_asr_kv_cache_failure", False):
+                    logger.warning(
+                        "KV-cache ASR generation failed; falling back to uncached "
+                        "generation. Error: %s",
+                        exc,
+                    )
+                    self._warned_asr_kv_cache_failure = True
+
+        return self._generate_text_batch_uncached(
+            input_ids=input_ids,
+            audio_mask=audio_mask,
+            text_causal_mask=text_causal_mask,
+            document_ids=document_ids,
+            position_ids=position_ids,
+            lengths_tensor=lengths_tensor,
+            tokenizer=tokenizer,
+            eos_id=eos_id,
+            max_len=max_len,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+        )
+
+    def _sample_next_text_ids(
+        self,
+        logits: torch.Tensor,
+        temperature: float,
+    ) -> torch.Tensor:
+        if temperature and temperature > 0:
+            probs = torch.softmax(logits / temperature, dim=-1)
+            return torch.multinomial(probs, num_samples=1)
+        return torch.argmax(logits, dim=-1, keepdim=True)
+
+    def _decode_generated_texts(
+        self,
+        generated: List[List[int]],
+        tokenizer: AutoTokenizer,
+    ) -> List[str]:
+        return [
+            tokenizer.decode(ids, skip_special_tokens=True).strip()
+            for ids in generated
+        ]
+
+    def _generate_text_batch_uncached(
+        self,
+        input_ids: torch.Tensor,
+        audio_mask: torch.Tensor,
+        text_causal_mask: torch.Tensor,
+        document_ids: torch.Tensor,
+        position_ids: torch.Tensor,
+        lengths_tensor: torch.Tensor,
+        tokenizer: AutoTokenizer,
+        eos_id: int,
+        max_len: int,
+        max_new_tokens: int,
+        temperature: float,
+    ) -> List[str]:
+        batch_size = input_ids.size(0)
+        c = input_ids.size(1)
+        device = input_ids.device
         last_indices = lengths_tensor - 1
         finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
         generated: List[List[int]] = [[] for _ in range(batch_size)]
@@ -459,11 +549,7 @@ class OmniVoiceForSpeechRecognition(PreTrainedModel):
             logits = self(**batch).logits
             batch_indices = torch.arange(batch_size, device=device)
             logits = logits[batch_indices, last_indices, :]
-            if temperature and temperature > 0:
-                probs = torch.softmax(logits / temperature, dim=-1)
-                next_id = torch.multinomial(probs, num_samples=1)
-            else:
-                next_id = torch.argmax(logits, dim=-1, keepdim=True)
+            next_id = self._sample_next_text_ids(logits, temperature)
 
             next_id = torch.where(
                 finished.unsqueeze(1),
@@ -502,10 +588,91 @@ class OmniVoiceForSpeechRecognition(PreTrainedModel):
             )
             last_indices = torch.full_like(last_indices, input_ids.size(2) - 1)
 
-        return [
-            tokenizer.decode(ids, skip_special_tokens=True).strip()
-            for ids in generated
-        ]
+        return self._decode_generated_texts(generated, tokenizer)
+
+    def _generate_text_batch_with_cache(
+        self,
+        input_ids: torch.Tensor,
+        audio_mask: torch.Tensor,
+        text_causal_mask: torch.Tensor,
+        document_ids: torch.Tensor,
+        position_ids: torch.Tensor,
+        prompt_valid_mask: torch.Tensor,
+        lengths_tensor: torch.Tensor,
+        tokenizer: AutoTokenizer,
+        eos_id: int,
+        max_new_tokens: int,
+        temperature: float,
+    ) -> List[str]:
+        batch_size = input_ids.size(0)
+        c = input_ids.size(1)
+        device = input_ids.device
+        batch_indices = torch.arange(batch_size, device=device)
+        last_indices = lengths_tensor - 1
+        finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
+        generated: List[List[int]] = [[] for _ in range(batch_size)]
+
+        prefill_outputs = self(
+            input_ids=input_ids,
+            audio_mask=audio_mask,
+            text_causal_mask=text_causal_mask,
+            document_ids=document_ids,
+            position_ids=position_ids,
+            use_cache=True,
+        )
+        past_key_values = prefill_outputs.past_key_values
+        if past_key_values is None:
+            raise RuntimeError("LLM did not return past_key_values.")
+
+        logits = prefill_outputs.logits[batch_indices, last_indices, :]
+        for step in range(max_new_tokens):
+            next_id = self._sample_next_text_ids(logits, temperature)
+            next_id = torch.where(
+                finished.unsqueeze(1),
+                torch.full_like(next_id, eos_id),
+                next_id,
+            )
+            next_ids = next_id.squeeze(1)
+            newly_finished = next_ids == eos_id
+
+            for idx, token_id in enumerate(next_ids.tolist()):
+                if not finished[idx] and token_id != eos_id:
+                    generated[idx].append(token_id)
+
+            finished = finished | newly_finished
+            if finished.all():
+                break
+
+            next_col = next_id.view(batch_size, 1, 1).expand(-1, c, -1)
+            next_audio_mask = audio_mask.new_zeros(batch_size, 1)
+            next_inputs_embeds = self.omnivoice._prepare_embed_inputs(
+                next_col,
+                next_audio_mask,
+            )
+            generated_mask = torch.ones(
+                batch_size,
+                step + 1,
+                dtype=torch.bool,
+                device=device,
+            )
+            decode_attention_mask = torch.cat(
+                [prompt_valid_mask, generated_mask],
+                dim=1,
+            )
+            next_position_ids = (lengths_tensor + step).unsqueeze(1)
+
+            decode_outputs = self.llm(
+                inputs_embeds=next_inputs_embeds,
+                attention_mask=decode_attention_mask,
+                return_dict=True,
+                position_ids=next_position_ids,
+                past_key_values=past_key_values,
+                use_cache=True,
+            )
+            past_key_values = decode_outputs.past_key_values
+            logits = self.text_head(decode_outputs[0])[:, -1, :]
+
+        return self._decode_generated_texts(generated, tokenizer)
 
     @staticmethod
     def _normalize_generate_audio_batch(

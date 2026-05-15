@@ -4,7 +4,7 @@
 import argparse
 import json
 import logging
-from typing import Iterable, Iterator, Optional
+from typing import Any, Iterable, Iterator, Optional
 
 import torch
 from tqdm.auto import tqdm
@@ -70,23 +70,48 @@ def _iter_samples(data_lst: str) -> Iterator[dict]:
     return iter(reader)
 
 
-def _iter_batches(
+def _sample_audio_length(sample: dict) -> int:
+    audio_tokens = sample["audio_tokens"]
+    if audio_tokens.dim() == 3 and audio_tokens.size(0) == 1:
+        audio_tokens = audio_tokens.squeeze(0)
+    return int(audio_tokens.size(-1))
+
+
+def _iter_windows(
     samples: Iterable[dict],
-    batch_size: int,
+    window_size: int,
     limit: Optional[int],
-) -> Iterator[list[dict]]:
-    batch = []
+) -> Iterator[list[dict[str, Any]]]:
+    window = []
     count = 0
     for sample in samples:
         if limit is not None and count >= limit:
             break
-        batch.append(sample)
+        window.append(
+            {
+                "order": count,
+                "sample": sample,
+                "audio_length": _sample_audio_length(sample),
+            }
+        )
         count += 1
-        if len(batch) >= batch_size:
-            yield batch
-            batch = []
-    if batch:
-        yield batch
+        if len(window) >= window_size:
+            yield window
+            window = []
+    if window:
+        yield window
+
+
+def _iter_batch_chunks(
+    window: list[dict[str, Any]],
+    batch_size: int,
+    use_bucketing: bool,
+) -> Iterator[list[dict[str, Any]]]:
+    items = window
+    if use_bucketing:
+        items = sorted(window, key=lambda item: item["audio_length"])
+    for start in range(0, len(items), batch_size):
+        yield items[start : start + batch_size]
 
 
 def transcribe(args):
@@ -97,6 +122,11 @@ def transcribe(args):
 
     if args.batch_size < 1:
         raise ValueError("--batch_size must be >= 1")
+    if args.bucket_size < 0:
+        raise ValueError("--bucket_size must be >= 0")
+
+    use_bucketing = args.bucket_size > args.batch_size
+    window_size = args.bucket_size if use_bucketing else args.batch_size
 
     device = args.device
     if device == "auto":
@@ -131,32 +161,50 @@ def transcribe(args):
         unit="sample",
     )
     try:
-        for batch in _iter_batches(
+        for window in _iter_windows(
             _iter_samples(args.data_lst),
-            args.batch_size,
+            window_size,
             args.limit,
         ):
-            labels = [sample["label"] for sample in batch]
-            audio_tokens = [sample["audio_tokens"] for sample in batch]
-            languages = [
-                args.language
-                if args.language is not None
-                else label.get("language_id")
-                for label in labels
-            ]
+            window_outputs: dict[int, tuple[dict, Optional[str], str]] = {}
+            for batch_items in _iter_batch_chunks(
+                window,
+                args.batch_size,
+                use_bucketing,
+            ):
+                samples = [item["sample"] for item in batch_items]
+                labels = [sample["label"] for sample in samples]
+                audio_tokens = [sample["audio_tokens"] for sample in samples]
+                languages = [
+                    args.language
+                    if args.language is not None
+                    else label.get("language_id")
+                    for label in labels
+                ]
 
-            texts = model.generate_text_batch(
-                audio_tokens=audio_tokens,
-                tokenizer=tokenizer,
-                languages=languages,
-                max_new_tokens=args.max_new_tokens,
-                temperature=args.temperature,
-            )
+                texts = model.generate_text_batch(
+                    audio_tokens=audio_tokens,
+                    tokenizer=tokenizer,
+                    languages=languages,
+                    max_new_tokens=args.max_new_tokens,
+                    temperature=args.temperature,
+                    use_cache=not args.no_kv_cache,
+                )
 
-            for label, language, text in zip(labels, languages, texts):
-                if not args.no_strip_suffix:
-                    text = _strip_generation_suffix(text, args.stop_marker)
+                for item, label, language, text in zip(
+                    batch_items,
+                    labels,
+                    languages,
+                    texts,
+                ):
+                    if not args.no_strip_suffix:
+                        text = _strip_generation_suffix(text, args.stop_marker)
+                    window_outputs[item["order"]] = (label, language, text)
 
+                progress.update(len(batch_items))
+
+            for order in sorted(window_outputs):
+                label, language, text = window_outputs[order]
                 if args.plain:
                     print(text, flush=True)
                     continue
@@ -169,8 +217,6 @@ def transcribe(args):
                 if args.include_reference:
                     item["reference"] = label.get("text")
                 print(json.dumps(item, ensure_ascii=False), flush=True)
-
-            progress.update(len(batch))
     finally:
         progress.close()
 
@@ -182,6 +228,15 @@ def main():
     parser.add_argument("--checkpoint", required=True, help="ASR checkpoint directory")
     parser.add_argument("--data_lst", required=True, help="WebDataset data.lst path")
     parser.add_argument("--batch_size", type=int, default=8)
+    parser.add_argument(
+        "--bucket_size",
+        type=int,
+        default=128,
+        help=(
+            "Sort samples by audio token length within this many input samples "
+            "before batching. Set 0 to disable."
+        ),
+    )
     parser.add_argument("--limit", type=int, default=None, help="Max samples to transcribe")
     parser.add_argument("--max_new_tokens", type=int, default=256)
     parser.add_argument("--temperature", type=float, default=0.0)
@@ -215,6 +270,11 @@ def main():
         "--include_reference",
         action="store_true",
         help="Include label['text'] in JSONL output for quick inspection.",
+    )
+    parser.add_argument(
+        "--no_kv_cache",
+        action="store_true",
+        help="Disable KV-cache generation and use full recomputation per token.",
     )
     parser.add_argument(
         "--no_strip_suffix",
