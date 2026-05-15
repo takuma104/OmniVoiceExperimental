@@ -13,6 +13,7 @@ from transformers import AutoTokenizer
 from omnivoice.data.dataset import WebDatasetReader, webdataset_manifest_reader
 from omnivoice.models.omnivoice_asr import OmniVoiceForSpeechRecognition
 from omnivoice.utils.flex_attention_patch import patch_flex_attention_for_sm12
+from accelerate.utils import set_seed
 
 logger = logging.getLogger(__name__)
 
@@ -120,6 +121,8 @@ def transcribe(args):
         level=logging.INFO if args.verbose else logging.WARNING,
     )
 
+    set_seed(args.seed)
+
     if args.batch_size < 1:
         raise ValueError("--batch_size must be >= 1")
     if args.bucket_size < 0:
@@ -154,6 +157,12 @@ def transcribe(args):
     )
     model.to(device)
     model.eval()
+
+    if args.output_jsonl is not None:
+        output_file = open(args.output_jsonl, "w", encoding="utf-8")
+        logger.info("Writing predictions to %s", args.output_jsonl)
+    else:
+        output_file = None
 
     progress = tqdm(
         total=args.limit,
@@ -206,7 +215,10 @@ def transcribe(args):
             for order in sorted(window_outputs):
                 label, language, text = window_outputs[order]
                 if args.plain:
-                    print(text, flush=True)
+                    if output_file is not None:
+                        print(text, file=output_file, flush=True)
+                    else:
+                        print(text, flush=True)
                     continue
 
                 item = {
@@ -216,10 +228,14 @@ def transcribe(args):
                 }
                 if args.include_reference:
                     item["reference"] = label.get("text")
-                print(json.dumps(item, ensure_ascii=False), flush=True)
+                if output_file is not None:
+                    print(json.dumps(item, ensure_ascii=False), file=output_file, flush=True)
+                else:
+                    print(json.dumps(item, ensure_ascii=False), flush=True)
     finally:
         progress.close()
-
+        if output_file is not None:
+            output_file.close()
 
 def main():
     parser = argparse.ArgumentParser(
@@ -292,6 +308,18 @@ def main():
         action="store_true",
         help="Disable tqdm progress on stderr.",
     )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=0,
+        help="Random seed for reproducibility. Affects generation sampling if --temperature > 0.",
+    )
+    parser.add_argument(
+        "--output_jsonl",
+        default=None,
+        help="Optional path to write per-sample predictions as JSONL",
+    )
+
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
     transcribe(args)
