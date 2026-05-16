@@ -213,7 +213,7 @@ asr_codebook_mode: str = "all_sum"
 asr_audio_embedding_mode: str = "all_sum"  # "all_sum" | "all_sum_adapter" | "weighted_sum"
 asr_audio_adapter_hidden_size: Optional[int] = None
 asr_train_audio_embedding_adapter: bool = True
-asr_attention_mode: str = "prefix_lm"
+asr_attention_mode: str = "prefix_lm"  # "prefix_lm" | "causal"
 ```
 
 ASR 専用 entrypoint に分ける場合:
@@ -360,8 +360,8 @@ OmniVoice は bidirectional / diffusion-style objective で TTS 学習されて�
 
 対策:
 
-- prefix-LM mask にして audio prefix は bidirectional のまま活かす。
-- text suffix のみ causal にする。
+- `prefix_lm` では audio prefix は bidirectional のまま活かし、text suffix のみ causal にする。
+- 比較用に `causal` を選ぶと、audio prefix も含めて全系列が causal になる。
 - zero-shot には期待せず SFT 前提にする。
 
 ### text_head distribution mismatch

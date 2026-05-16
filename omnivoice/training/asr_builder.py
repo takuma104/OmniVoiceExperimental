@@ -72,10 +72,10 @@ def build_asr_model_and_tokenizer(
             f"{config.asr_audio_embedding_mode!r}. Expected one of "
             "'all_sum', 'all_sum_adapter', or 'weighted_sum'."
         )
-    if config.asr_attention_mode != "prefix_lm":
+    if config.asr_attention_mode not in {"prefix_lm", "causal"}:
         raise ValueError(
-            "Only prefix_lm attention is supported for OmniVoice ASR. "
-            f"Got asr_attention_mode={config.asr_attention_mode!r}."
+            "Unsupported ASR attention mode: "
+            f"{config.asr_attention_mode!r}. Expected 'prefix_lm' or 'causal'."
         )
 
     if config.asr_init_from_asr_checkpoint:
@@ -92,6 +92,7 @@ def build_asr_model_and_tokenizer(
             config.init_from_checkpoint,
             audio_embedding_mode=config.asr_audio_embedding_mode,
             audio_adapter_hidden_size=config.asr_audio_adapter_hidden_size,
+            attention_mode=config.asr_attention_mode,
             attn_implementation="flex_attention",
             dtype=torch.float32,
         )
@@ -120,7 +121,11 @@ def build_asr_model_and_tokenizer(
             omnivoice=OmniVoice(config=ov_config, llm=llm),
             audio_embedding_mode=config.asr_audio_embedding_mode,
             audio_adapter_hidden_size=config.asr_audio_adapter_hidden_size,
+            attention_mode=config.asr_attention_mode,
         )
+
+    model.asr_attention_mode = config.asr_attention_mode
+    model.config.asr_attention_mode = config.asr_attention_mode
 
     model.resize_text_vocab(len(tokenizer))
     model.config.pad_token_id = tokenizer.pad_token_id

@@ -48,6 +48,7 @@ class OmniVoiceForSpeechRecognition(PreTrainedModel):
         omnivoice: Optional[OmniVoice] = None,
         audio_embedding_mode: Optional[str] = None,
         audio_adapter_hidden_size: Optional[int] = None,
+        attention_mode: Optional[str] = None,
     ):
         super().__init__(config)
         self.all_tied_weights_keys = {}
@@ -94,6 +95,16 @@ class OmniVoiceForSpeechRecognition(PreTrainedModel):
             )
         else:
             self.audio_codebook_weights = None
+
+        self.asr_attention_mode = attention_mode or getattr(
+            self.config, "asr_attention_mode", "prefix_lm"
+        )
+        if self.asr_attention_mode not in {"prefix_lm", "causal"}:
+            raise ValueError(
+                "Unsupported ASR attention mode: "
+                f"{self.asr_attention_mode!r}"
+            )
+        self.config.asr_attention_mode = self.asr_attention_mode
 
     @property
     def llm(self):
@@ -232,6 +243,7 @@ class OmniVoiceForSpeechRecognition(PreTrainedModel):
         pretrained_model_name_or_path: str,
         audio_embedding_mode: Optional[str] = None,
         audio_adapter_hidden_size: Optional[int] = None,
+        attention_mode: Optional[str] = None,
         **kwargs,
     ):
         base = OmniVoice.from_pretrained(
@@ -244,6 +256,7 @@ class OmniVoiceForSpeechRecognition(PreTrainedModel):
             omnivoice=base,
             audio_embedding_mode=audio_embedding_mode,
             audio_adapter_hidden_size=audio_adapter_hidden_size,
+            attention_mode=attention_mode,
         )
 
     def _prepare_embed_inputs(
@@ -290,11 +303,16 @@ class OmniVoiceForSpeechRecognition(PreTrainedModel):
                 as_attention_bias=attn_implementation == "eager",
             )
 
-        return create_block_mask(
-            _get_asr_prefix_lm_mask(
+        if self.asr_attention_mode == "causal":
+            mask_mod = _get_asr_causal_mask(document_ids.to(device))
+        else:
+            mask_mod = _get_asr_prefix_lm_mask(
                 document_ids.to(device),
                 text_causal_mask.to(device),
-            ),
+            )
+
+        return create_block_mask(
+            mask_mod,
             B=input_ids.size(0),
             H=None,
             Q_LEN=input_ids.size(-1),
@@ -325,10 +343,13 @@ class OmniVoiceForSpeechRecognition(PreTrainedModel):
 
         same_doc = document_ids[:, :, None] == document_ids[:, None, :]
         valid_doc = document_ids[:, :, None] >= 0
-        kv_is_prefix = ~text_causal_mask[:, None, :]
-        q_is_text = text_causal_mask[:, :, None]
-        causal_text = q_is_text & (q_idx >= kv_idx)
-        attention_mask = valid_doc & same_doc & (kv_is_prefix | causal_text)
+        if self.asr_attention_mode == "causal":
+            attention_mask = valid_doc & same_doc & (q_idx >= kv_idx)
+        else:
+            kv_is_prefix = ~text_causal_mask[:, None, :]
+            q_is_text = text_causal_mask[:, :, None]
+            causal_text = q_is_text & (q_idx >= kv_idx)
+            attention_mask = valid_doc & same_doc & (kv_is_prefix | causal_text)
         attention_mask = attention_mask.unsqueeze(1)
 
         if as_attention_bias:
@@ -813,6 +834,23 @@ class OmniVoiceForSpeechRecognition(PreTrainedModel):
                 )
 
         return samples
+
+
+def _get_asr_causal_mask(document_ids):
+    return partial(_mask_mod_asr_causal, document_ids)
+
+
+def _mask_mod_asr_causal(document_ids, b, h, q_idx, kv_idx):
+    if document_ids.ndim == 1:
+        q_doc = document_ids[q_idx]
+        kv_doc = document_ids[kv_idx]
+    else:
+        q_doc = document_ids[b, q_idx]
+        kv_doc = document_ids[b, kv_idx]
+
+    same_doc = q_doc == kv_doc
+    valid_doc = q_doc >= 0
+    return valid_doc & same_doc & (q_idx >= kv_idx)
 
 
 def _get_asr_prefix_lm_mask(document_ids, text_causal_mask):
