@@ -8,7 +8,7 @@ then adds a Qwen text head for autoregressive transcript generation.
 import logging
 from dataclasses import dataclass
 from functools import partial
-from typing import List, Optional, Sequence, Union
+from typing import Any, List, Optional, Sequence, Union
 
 import torch
 import torch.nn as nn
@@ -27,6 +27,7 @@ class OmniVoiceASROutput(ModelOutput):
     loss: Optional[torch.Tensor] = None
     logits: Optional[torch.Tensor] = None
     past_key_values: Optional[object] = None
+    attentions: Optional[object] = None
 
 
 class OmniVoiceForSpeechRecognition(PreTrainedModel):
@@ -373,6 +374,7 @@ class OmniVoiceForSpeechRecognition(PreTrainedModel):
         text_causal_mask: Optional[torch.Tensor] = None,
         past_key_values: Optional[object] = None,
         use_cache: Optional[bool] = None,
+        output_attentions: Optional[bool] = None,
     ):
         inputs_embeds = self._prepare_embed_inputs(input_ids, audio_mask)
 
@@ -396,6 +398,7 @@ class OmniVoiceForSpeechRecognition(PreTrainedModel):
             position_ids=position_ids,
             past_key_values=past_key_values,
             use_cache=use_cache,
+            output_attentions=output_attentions,
         )
         hidden_states = llm_outputs[0]
         logits = self.text_head(hidden_states)
@@ -414,7 +417,246 @@ class OmniVoiceForSpeechRecognition(PreTrainedModel):
             loss=loss,
             logits=logits,
             past_key_values=getattr(llm_outputs, "past_key_values", None),
+            attentions=getattr(llm_outputs, "attentions", None),
         )
+
+    @staticmethod
+    def _resolve_attention_indices(
+        selection: Optional[Union[str, int, Sequence[int]]],
+        total: int,
+        name: str,
+    ) -> List[int]:
+        if selection is None:
+            return list(range(total))
+        if isinstance(selection, str):
+            value = selection.strip().lower()
+            if value in {"", "all"}:
+                return list(range(total))
+            if value == "last":
+                return [total - 1]
+            raw_indices = [item.strip() for item in value.split(",") if item.strip()]
+            indices = [int(item) for item in raw_indices]
+        elif isinstance(selection, int):
+            indices = [selection]
+        else:
+            indices = [int(item) for item in selection]
+
+        resolved = []
+        for index in indices:
+            if index < 0:
+                index += total
+            if index < 0 or index >= total:
+                raise ValueError(
+                    f"{name} index {index} is out of range for {total} {name}s."
+                )
+            resolved.append(index)
+        return resolved
+
+    def _aggregate_audio_attention(
+        self,
+        attentions: object,
+        query_index: int,
+        audio_start: int,
+        audio_end: int,
+        layers: Optional[Union[str, int, Sequence[int]]],
+        heads: Optional[Union[str, int, Sequence[int]]],
+    ) -> torch.Tensor:
+        if attentions is None:
+            raise RuntimeError(
+                "The LLM did not return attentions. Load the model with "
+                'attn_implementation="eager" and call with output_attentions=True.'
+            )
+
+        layer_attentions = list(attentions)
+        layer_indices = self._resolve_attention_indices(
+            layers if layers is not None else "last",
+            len(layer_attentions),
+            "layer",
+        )
+
+        per_layer = []
+        for layer_index in layer_indices:
+            layer_attention = layer_attentions[layer_index]
+            if layer_attention is None:
+                raise RuntimeError(
+                    f"Layer {layer_index} did not return attention weights."
+                )
+            num_heads = layer_attention.size(1)
+            head_indices = self._resolve_attention_indices(heads, num_heads, "head")
+            query_attention = layer_attention[
+                0,
+                head_indices,
+                query_index,
+                audio_start:audio_end,
+            ]
+            per_layer.append(query_attention.float().mean(dim=0))
+
+        scores = torch.stack(per_layer, dim=0).mean(dim=0)
+        total = scores.sum()
+        if torch.isfinite(total) and total > 0:
+            scores = scores / total
+        return scores.detach().cpu()
+
+    @torch.inference_mode()
+    def generate_text_attention_trace(
+        self,
+        audio_tokens: torch.Tensor,
+        tokenizer: AutoTokenizer,
+        language: Optional[str] = None,
+        max_new_tokens: int = 256,
+        temperature: float = 0.0,
+        layers: Optional[Union[str, int, Sequence[int]]] = "last",
+        heads: Optional[Union[str, int, Sequence[int]]] = None,
+        include_eos: bool = False,
+    ) -> dict[str, Any]:
+        """Generate one transcript and collect audio-prefix attention per step.
+
+        Each attention row is the self-attention of the query position whose
+        hidden state predicts the recorded output token. For the first emitted
+        text token, that query is the final ``<|text_start|>`` position.
+        """
+        samples = self._normalize_generate_audio_batch(
+            audio_tokens=audio_tokens,
+            audio_lengths=None,
+            num_codebooks=self.config.num_audio_codebook,
+        )
+        if len(samples) != 1:
+            raise ValueError("generate_text_attention_trace() expects one sample.")
+
+        device = next(self.parameters()).device
+        c = self.config.num_audio_codebook
+        sample = samples[0].to(device=device, dtype=torch.long)
+
+        text_start_ids = tokenizer("<|text_start|>", return_tensors="pt").input_ids.to(
+            device
+        )
+        eos_ids = tokenizer("<|text_end|>", return_tensors="pt").input_ids.to(device)
+        eos_id = eos_ids[0, -1].item()
+
+        style = "<|asr|>"
+        if language is not None:
+            style += f"<|lang_start|>{language}<|lang_end|>"
+        style_ids = tokenizer(style, return_tensors="pt").input_ids.to(device)
+
+        style_inputs = style_ids.repeat(c, 1)
+        text_inputs = text_start_ids.repeat(c, 1)
+        sample_input_ids = torch.cat([style_inputs, sample, text_inputs], dim=1)
+        seq_len = sample_input_ids.size(1)
+
+        input_ids = sample_input_ids.unsqueeze(0)
+        audio_mask = torch.zeros(1, seq_len, dtype=torch.bool, device=device)
+        audio_start = style_inputs.size(1)
+        audio_end = audio_start + sample.size(1)
+        audio_mask[:, audio_start:audio_end] = True
+
+        text_causal_mask = torch.zeros_like(audio_mask)
+        text_causal_mask[:, -text_inputs.size(1) :] = True
+        document_ids = torch.zeros(1, seq_len, dtype=torch.int32, device=device)
+        position_ids = torch.arange(seq_len, device=device).unsqueeze(0)
+
+        outputs = self(
+            input_ids=input_ids,
+            audio_mask=audio_mask,
+            text_causal_mask=text_causal_mask,
+            document_ids=document_ids,
+            position_ids=position_ids,
+            use_cache=True,
+            output_attentions=True,
+        )
+        past_key_values = outputs.past_key_values
+        if past_key_values is None:
+            raise RuntimeError("LLM did not return past_key_values.")
+
+        logits = outputs.logits[:, -1, :]
+        current_attentions = outputs.attentions
+        current_query_index = -1
+        current_query_id = int(input_ids[0, 0, -1].item())
+
+        generated: List[int] = []
+        token_ids: List[int] = []
+        token_texts: List[str] = []
+        query_token_ids: List[int] = []
+        query_token_texts: List[str] = []
+        audio_attention_rows: List[torch.Tensor] = []
+        prompt_valid_mask = torch.ones(1, seq_len, dtype=torch.bool, device=device)
+        lengths_tensor = torch.tensor([seq_len], dtype=torch.long, device=device)
+
+        for step in range(max_new_tokens):
+            next_id = self._sample_next_text_ids(logits, temperature)
+            token_id = int(next_id.item())
+
+            if token_id != eos_id or include_eos:
+                audio_attention_rows.append(
+                    self._aggregate_audio_attention(
+                        attentions=current_attentions,
+                        query_index=current_query_index,
+                        audio_start=audio_start,
+                        audio_end=audio_end,
+                        layers=layers,
+                        heads=heads,
+                    )
+                )
+                token_ids.append(token_id)
+                token_texts.append(
+                    tokenizer.decode([token_id], skip_special_tokens=False)
+                )
+                query_token_ids.append(current_query_id)
+                query_token_texts.append(
+                    tokenizer.decode([current_query_id], skip_special_tokens=False)
+                )
+
+            if token_id == eos_id:
+                break
+
+            generated.append(token_id)
+            next_col = next_id.view(1, 1, 1).expand(-1, c, -1)
+            next_audio_mask = audio_mask.new_zeros(1, 1)
+            next_inputs_embeds = self._prepare_embed_inputs(next_col, next_audio_mask)
+            generated_mask = torch.ones(
+                1,
+                step + 1,
+                dtype=torch.bool,
+                device=device,
+            )
+            decode_attention_mask = torch.cat(
+                [prompt_valid_mask, generated_mask],
+                dim=1,
+            )
+            next_position_ids = (lengths_tensor + step).unsqueeze(1)
+
+            decode_outputs = self.llm(
+                inputs_embeds=next_inputs_embeds,
+                attention_mask=decode_attention_mask,
+                return_dict=True,
+                position_ids=next_position_ids,
+                past_key_values=past_key_values,
+                use_cache=True,
+                output_attentions=True,
+            )
+            past_key_values = decode_outputs.past_key_values
+            current_attentions = getattr(decode_outputs, "attentions", None)
+            current_query_index = -1
+            current_query_id = token_id
+            logits = self.text_head(decode_outputs[0])[:, -1, :]
+
+        if audio_attention_rows:
+            audio_attention = torch.stack(audio_attention_rows, dim=0)
+        else:
+            audio_attention = torch.empty(0, sample.size(1), dtype=torch.float32)
+
+        return {
+            "text": tokenizer.decode(generated, skip_special_tokens=True).strip(),
+            "token_ids": token_ids,
+            "token_texts": token_texts,
+            "query_token_ids": query_token_ids,
+            "query_token_texts": query_token_texts,
+            "audio_attention": audio_attention,
+            "audio_start": audio_start,
+            "audio_end": audio_end,
+            "audio_num_tokens": sample.size(1),
+            "layers": layers,
+            "heads": heads,
+        }
 
     @torch.inference_mode()
     def generate_text(
