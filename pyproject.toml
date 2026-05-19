@@ -69,6 +69,9 @@ omnivoice-infer = "omnivoice.cli.infer:main"
 omnivoice-infer-batch = "omnivoice.cli.infer_batch:main"
 omnivoice-demo = "omnivoice.cli.demo:main"
 omnivoice-asr-transcribe = "omnivoice.cli.transcribe_asr:main"
+omnivoice-asr-attention = "omnivoice.cli.visualize_asr_attention:main"
+omnivoice-asr-timestamps = "omnivoice.cli.timestamp_asr:main"
+omnivoice-asr-timestamps-visualize = "omnivoice.cli.visualize_asr_timestamps:main"
 
 [project.urls]
 Homepage = "https://github.com/k2-fsa/OmniVoice"
