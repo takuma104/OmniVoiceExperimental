@@ -1,11 +1,20 @@
-"""Workaround for flex_attention OOM on SM 12.x (RTX 5090 / Blackwell consumer).
+"""Workaround for flex_attention OOM on consumer GPUs with limited shared memory (~99KB).
 
-PyTorch 2.8 treats SM >= 9.0 as H100 (228KB shared memory) for autotune config
-selection. SM 12.0 (GB202) is Blackwell consumer with only 100KB, so H100 configs
-like FlexConfig(128, 64, 3, 8) require ~156KB and fail at Triton compile time.
+PyTorch's inductor autotune selects flex_attention configs sized for data-center GPUs
+(A100: 192KB, H100: 228KB). Consumer GPUs share only ~99KB (101376 bytes) per block:
+  - SM 8.6: RTX 30xx (GA102/104)
+  - SM 8.9: RTX 40xx (Ada Lovelace consumer)
+  - SM 12.0: RTX 50xx (GB202 Blackwell consumer)
 
-This patch overrides the heuristic to use smaller block sizes for SM 12.x.
-Remove once PyTorch adds native SM 12.x flex_attention configs.
+For SM 8.6, PyTorch >= 2.10 falls into the `a100_default_flex_config` bucket
+(e.g. FlexConfig(128, 64, 3, 8) for bfloat16) which requires ~130KB and fails.
+
+Import path changed between PyTorch versions:
+  - 2.8:  torch._inductor.template_heuristics
+  - 2.10: torch._inductor.template_heuristics.triton
+Backward configs also changed from FlexConfig to FlexBwDConfig in 2.10.
+
+Remove once PyTorch adds native per-architecture flex_attention configs.
 """
 
 import logging
@@ -14,31 +23,48 @@ import torch
 
 logger = logging.getLogger(__name__)
 
+# Data-center SM capabilities with large shared memory (192KB+) — skip patching.
+_HIGH_SMEM_CAPABILITIES = {(8, 0), (9, 0)}  # A100 (8.0), H100/H200 (9.0)
 
-def patch_flex_attention_for_sm12() -> None:
+
+def patch_flex_attention_limited_smem() -> None:
+    """Apply conservative flex_attention configs for consumer GPUs (~99KB shared mem)."""
     if not torch.cuda.is_available():
         return
 
     capability = torch.cuda.get_device_capability()
-    if capability[0] < 12:
+    # Skip old GPUs and known data-center GPUs with ample shared memory.
+    if capability[0] < 8 or capability in _HIGH_SMEM_CAPABILITIES:
         return
 
-    from torch._inductor import config as inductor_config
-    from torch._inductor.template_heuristics import CUDAConfigHeuristic, FlexConfig
+    # PyTorch 2.10+ moved these into the .triton submodule and introduced FlexBwDConfig.
+    # Fall back to the older 2.8 location if .triton doesn't exist.
+    try:
+        from torch._inductor.template_heuristics.triton import (
+            CUDAConfigHeuristic,
+            FlexBwDConfig,
+            FlexConfig,
+        )
+    except ImportError:
+        from torch._inductor.template_heuristics import CUDAConfigHeuristic, FlexConfig  # type: ignore[no-redef]
 
-    # Conservative configs sized to fit within 100KB shared memory.
+        FlexBwDConfig = None  # type: ignore[assignment,misc]
+
+    from torch._inductor import config as inductor_config
+
+    # Conservative fwd configs sized for ~99KB:
     # FlexConfig(block_m, block_n, num_stages, num_warps)
-    # For bfloat16, head_dim=128: 64×128×2 + 64×128×2×2 + 64×64×4 = 81KB
-    _sm12_fwd_configs = {
-        (torch.float32, 64): FlexConfig(64, 32, 1, 4),
-        (torch.float32, 128): FlexConfig(64, 32, 1, 4),
-        (torch.float32, 256): FlexConfig(32, 16, 1, 4),
-        (torch.bfloat16, 64): FlexConfig(64, 64, 1, 4),
+    # bfloat16, head_dim=128, (64,64,1): Q=16KB + K=16KB + V=16KB + scores=8KB ≈ 56KB
+    _fwd_configs = {
+        (torch.float32, 64):   FlexConfig(64, 32, 1, 4),
+        (torch.float32, 128):  FlexConfig(64, 32, 1, 4),
+        (torch.float32, 256):  FlexConfig(32, 16, 1, 4),
+        (torch.bfloat16, 64):  FlexConfig(64, 64, 1, 4),
         (torch.bfloat16, 128): FlexConfig(64, 64, 1, 4),
         (torch.bfloat16, 256): FlexConfig(32, 32, 1, 4),
-        (torch.float16, 64): FlexConfig(64, 64, 1, 4),
-        (torch.float16, 128): FlexConfig(64, 64, 1, 4),
-        (torch.float16, 256): FlexConfig(32, 32, 1, 4),
+        (torch.float16, 64):   FlexConfig(64, 64, 1, 4),
+        (torch.float16, 128):  FlexConfig(64, 64, 1, 4),
+        (torch.float16, 256):  FlexConfig(32, 32, 1, 4),
     }
 
     def _patched_fwd(self, head_dim: int, dtype) -> list:
@@ -47,7 +73,7 @@ def patch_flex_attention_for_sm12() -> None:
             if inductor_config.max_autotune_flex_search_space == "EXHAUSTIVE":
                 return self.exhaustive_flex_attn_fwd_configs
             configs += self.flex_attn_fwd_autotune_configs
-        default = _sm12_fwd_configs.get((dtype, head_dim), FlexConfig(64, 32, 1, 4))
+        default = _fwd_configs.get((dtype, head_dim), FlexConfig(64, 32, 1, 4))
         if default not in configs:
             configs.append(default)
         return configs
@@ -58,7 +84,12 @@ def patch_flex_attention_for_sm12() -> None:
             if inductor_config.max_autotune_flex_search_space == "EXHAUSTIVE":
                 return self.exhaustive_flex_attn_bwd_configs
             configs += self.flex_attn_bwd_autotune_configs
-        default = FlexConfig(16, 16, 1, 4)
+        # PyTorch 2.10+: bwd uses FlexBwDConfig(m1, n1, m2, n2, stages, warps)
+        # Constraints: block_n1 % block_m1 == 0, block_m2 % block_n2 == 0
+        if FlexBwDConfig is not None:
+            default = FlexBwDConfig(32, 32, 32, 32, 1, 4)
+        else:
+            default = FlexConfig(16, 16, 1, 4)
         if default not in configs:
             configs.append(default)
         return configs
@@ -68,6 +99,13 @@ def patch_flex_attention_for_sm12() -> None:
 
     device_name = torch.cuda.get_device_name(0)
     logger.info(
-        f"Applied flex_attention SM 12.x patch for {device_name} "
-        f"(SM {capability[0]}.{capability[1]}, 100KB shared mem limit)."
+        "Applied flex_attention limited-smem patch for %s "
+        "(SM %d.%d, ~99KB shared mem limit).",
+        device_name,
+        capability[0],
+        capability[1],
     )
+
+
+# Backward-compatible alias (originally written for RTX 5090 / SM 12.x).
+patch_flex_attention_for_sm12 = patch_flex_attention_limited_smem

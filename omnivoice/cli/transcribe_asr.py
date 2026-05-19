@@ -12,7 +12,7 @@ from transformers import AutoTokenizer
 
 from omnivoice.data.dataset import WebDatasetReader, webdataset_manifest_reader
 from omnivoice.models.omnivoice_asr import OmniVoiceForSpeechRecognition
-from omnivoice.utils.flex_attention_patch import patch_flex_attention_for_sm12
+from omnivoice.utils.flex_attention_patch import patch_flex_attention_limited_smem
 from accelerate.utils import set_seed
 
 logger = logging.getLogger(__name__)
@@ -137,7 +137,7 @@ def transcribe(args):
     dtype = _resolve_dtype(args.dtype, device)
     attn_implementation = _resolve_attn_implementation(args.attn_implementation)
     if attn_implementation == "flex_attention":
-        patch_flex_attention_for_sm12()
+        patch_flex_attention_limited_smem()
 
     if device == "cpu":
         logger.warning("CPU transcription may be very slow.")

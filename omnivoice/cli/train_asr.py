@@ -9,7 +9,7 @@ from omnivoice.training.asr_builder import (
 )
 from omnivoice.training.config import TrainingConfig
 from omnivoice.training.trainer import OmniTrainer
-from omnivoice.utils.flex_attention_patch import patch_flex_attention_for_sm12
+from omnivoice.utils.flex_attention_patch import patch_flex_attention_limited_smem
 
 
 def main():
@@ -25,7 +25,7 @@ def main():
     )
     args = parser.parse_args()
 
-    patch_flex_attention_for_sm12()
+    patch_flex_attention_limited_smem()
 
     config = TrainingConfig.from_json(args.train_config)
     config.output_dir = args.output_dir

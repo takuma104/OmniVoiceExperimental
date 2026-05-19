@@ -345,6 +345,7 @@ class WebDatasetReader(IterableDataReader):
             shardshuffle=False,
             workersplitter=wds.split_by_worker,
             nodesplitter=wds.split_by_node,
+            empty_check=False,
         )
 
         pipeline = dataset.decode().map(self.sample_decoder)
