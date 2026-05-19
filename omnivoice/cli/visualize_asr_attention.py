@@ -204,6 +204,7 @@ def _write_html(
     display_attention: np.ndarray,
     bin_starts: np.ndarray,
     bin_ends: np.ndarray,
+    layer_display_attentions: Optional[dict[str, np.ndarray]] = None,
 ):
     tokens = metadata["tokens"]
     rows = display_attention.shape[0]
@@ -217,12 +218,18 @@ def _write_html(
         max_value = 0.0
     payload = {
         "attention": display_attention.tolist(),
+        "layerAttentions": {
+            key: value.tolist()
+            for key, value in (layer_display_attentions or {}).items()
+        },
+        "layerLabels": list((layer_display_attentions or {}).keys()),
         "tokens": [item["token"] for item in tokens],
         "queryTokens": [item["query_token"] for item in tokens],
         "binStarts": bin_starts.tolist(),
         "binEnds": bin_ends.tolist(),
         "audioSeconds": metadata["audio_seconds"],
         "maxValue": max_value,
+        "displayPercentile": display_percentile,
         "rows": rows,
         "cols": cols,
         "overlayRidge": bool(metadata.get("overlay_ridge")),
@@ -250,6 +257,17 @@ def _write_html(
             "</tr>"
         )
     top_rows = "\n".join(top_table_rows)
+    if layer_display_attentions:
+        layer_controls = "\n".join(
+            '<label class="layer-toggle">'
+            f'<input type="checkbox" class="layer-check" data-layer="{html.escape(layer)}" checked>'
+            f"Layer {html.escape(layer)}"
+            "</label>"
+            for layer in layer_display_attentions
+        )
+        layer_controls_html = f'<div class="layer-controls">{layer_controls}</div>'
+    else:
+        layer_controls_html = ""
 
     document = f"""<!doctype html>
 <html lang="en">
@@ -294,6 +312,22 @@ h1 {{ font-size: 20px; margin: 0 0 8px; }}
   border: 1px solid #d7dde2;
   padding: 0;
 }}
+.layer-controls {{
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 12px;
+  margin: 0 0 10px;
+  padding: 8px 10px;
+  background: #ffffff;
+  border: 1px solid #d7dde2;
+  font-size: 12px;
+}}
+.layer-toggle {{
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: #31404a;
+}}
 canvas {{
   display: block;
   image-rendering: pixelated;
@@ -324,6 +358,7 @@ hypothesis: {html.escape(str(metadata.get("hypothesis", "")))}<br>
 audio tokens: {metadata["audio_num_tokens"]}, audio seconds: {metadata["audio_seconds"]:.3f}<br>
 display: {html.escape(str(metadata.get("enhance")))} / percentile {metadata.get("display_percentile")}<br>
 </p>
+{layer_controls_html}
 <div class="viewer">
   <div class="labels">{token_labels}</div>
   <div class="canvas-wrap"><canvas id="heatmap"></canvas></div>
@@ -342,44 +377,79 @@ canvas.height = Math.max(1, payload.rows * rowHeight);
 canvas.style.width = `${{canvas.width}}px`;
 canvas.style.height = `${{canvas.height}}px`;
 const ctx = canvas.getContext("2d");
-function color(value) {{
-  const maxValue = payload.maxValue || 1e-12;
+function percentile(values, pct) {{
+  if (!values.length) return 0;
+  const sorted = Array.from(values).sort((a, b) => a - b);
+  const pos = Math.max(0, Math.min(sorted.length - 1, (pct / 100) * (sorted.length - 1)));
+  const lo = Math.floor(pos);
+  const hi = Math.ceil(pos);
+  if (lo === hi) return sorted[lo];
+  return sorted[lo] + (sorted[hi] - sorted[lo]) * (pos - lo);
+}}
+function activeMatrix() {{
+  const checks = Array.from(document.querySelectorAll(".layer-check"));
+  const active = checks.filter((check) => check.checked).map((check) => check.dataset.layer);
+  if (!active.length || !payload.layerLabels.length) return payload.attention;
+  const matrix = Array.from({{length: payload.rows}}, () => Array(payload.cols).fill(0));
+  for (const layer of active) {{
+    const layerMatrix = payload.layerAttentions[layer];
+    if (!layerMatrix) continue;
+    for (let r = 0; r < payload.rows; r++) {{
+      for (let c = 0; c < payload.cols; c++) {{
+        matrix[r][c] += layerMatrix[r][c] / active.length;
+      }}
+    }}
+  }}
+  return matrix;
+}}
+function color(value, maxValue) {{
   const x = Math.max(0, Math.min(1, Math.sqrt(value / maxValue)));
   const r = Math.round(250 - 210 * x);
   const g = Math.round(252 - 118 * x);
   const b = Math.round(255 - 40 * x);
   return `rgb(${{r}},${{g}},${{b}})`;
 }}
-for (let r = 0; r < payload.rows; r++) {{
-  for (let c = 0; c < payload.cols; c++) {{
-    ctx.fillStyle = color(payload.attention[r][c]);
-    ctx.fillRect(c * cellWidth, r * rowHeight, cellWidth, rowHeight);
-  }}
-}}
-if (payload.overlayRidge && payload.rows > 0 && payload.cols > 0) {{
-  ctx.beginPath();
-  ctx.strokeStyle = "rgba(206, 42, 42, 0.85)";
-  ctx.lineWidth = 1.5;
-  let lastCol = 0;
+function render() {{
+  const matrix = activeMatrix();
+  const flat = matrix.flat();
+  let maxValue = percentile(flat, payload.displayPercentile || 100);
+  if (!maxValue || maxValue <= 0) maxValue = Math.max(...flat, payload.maxValue, 1e-12);
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
   for (let r = 0; r < payload.rows; r++) {{
-    let bestCol = 0;
-    let bestValue = -1;
     for (let c = 0; c < payload.cols; c++) {{
-      const value = payload.attention[r][c];
-      if (value > bestValue) {{
-        bestValue = value;
-        bestCol = c;
-      }}
+      ctx.fillStyle = color(matrix[r][c], maxValue);
+      ctx.fillRect(c * cellWidth, r * rowHeight, cellWidth, rowHeight);
     }}
-    if (bestCol < lastCol) bestCol = lastCol;
-    lastCol = bestCol;
-    const x = bestCol * cellWidth + cellWidth / 2;
-    const y = r * rowHeight + rowHeight / 2;
-    if (r === 0) ctx.moveTo(x, y);
-    else ctx.lineTo(x, y);
   }}
-  ctx.stroke();
+  if (payload.overlayRidge && payload.rows > 0 && payload.cols > 0) {{
+    ctx.beginPath();
+    ctx.strokeStyle = "rgba(206, 42, 42, 0.85)";
+    ctx.lineWidth = 1.5;
+    let lastCol = 0;
+    for (let r = 0; r < payload.rows; r++) {{
+      let bestCol = 0;
+      let bestValue = -1;
+      for (let c = 0; c < payload.cols; c++) {{
+        const value = matrix[r][c];
+        if (value > bestValue) {{
+          bestValue = value;
+          bestCol = c;
+        }}
+      }}
+      if (bestCol < lastCol) bestCol = lastCol;
+      lastCol = bestCol;
+      const x = bestCol * cellWidth + cellWidth / 2;
+      const y = r * rowHeight + rowHeight / 2;
+      if (r === 0) ctx.moveTo(x, y);
+      else ctx.lineTo(x, y);
+    }}
+    ctx.stroke();
+  }}
 }}
+for (const check of document.querySelectorAll(".layer-check")) {{
+  check.addEventListener("change", render);
+}}
+render();
 </script>
 </body>
 </html>
@@ -444,6 +514,7 @@ def visualize(args):
         layers=args.layers,
         heads=args.heads,
         include_eos=args.include_eos,
+        return_layer_attentions=not args.no_html_layer_controls,
     )
 
     attention = trace["audio_attention"].numpy()
@@ -454,6 +525,34 @@ def visualize(args):
         power=args.enhance_power,
         smooth_radius=args.enhance_smooth_radius,
     )
+    layer_labels = []
+    layer_attention_stack = None
+    layer_enhanced_attention_stack = None
+    layer_display_attentions = None
+    layer_audio_attentions = trace.get("layer_audio_attentions")
+    if layer_audio_attentions:
+        layer_display_attentions = {}
+        layer_attention_arrays = []
+        layer_enhanced_arrays = []
+        for layer_index, layer_attention in sorted(layer_audio_attentions.items()):
+            layer_labels.append(int(layer_index))
+            layer_attention_array = layer_attention.numpy()
+            layer_enhanced = _enhance_attention_for_alignment(
+                attention=layer_attention_array,
+                mode=args.enhance,
+                baseline_quantile=args.enhance_baseline_quantile,
+                power=args.enhance_power,
+                smooth_radius=args.enhance_smooth_radius,
+            )
+            layer_binned, _, _ = _bin_attention(
+                layer_enhanced,
+                max_audio_bins=args.max_audio_bins,
+            )
+            layer_display_attentions[str(layer_index)] = layer_binned
+            layer_attention_arrays.append(layer_attention_array)
+            layer_enhanced_arrays.append(layer_enhanced)
+        layer_attention_stack = np.stack(layer_attention_arrays, axis=0)
+        layer_enhanced_attention_stack = np.stack(layer_enhanced_arrays, axis=0)
     audio_seconds = _audio_duration_seconds(label, trace["audio_num_tokens"], args)
     top_audio_tokens = _top_audio_tokens(
         attention=enhanced_attention,
@@ -502,6 +601,8 @@ def visualize(args):
         "enhance_smooth_radius": args.enhance_smooth_radius,
         "display_percentile": args.display_percentile,
         "overlay_ridge": not args.no_overlay_ridge,
+        "html_layer_controls": not args.no_html_layer_controls,
+        "html_layer_labels": layer_labels,
         "attention_semantics": (
             "Each row is the attention of the causal-LM query position whose "
             "hidden state predicted the listed output token."
@@ -526,23 +627,34 @@ def visualize(args):
         * float(audio_seconds)
         / float(trace["audio_num_tokens"])
     )
-    np.savez_compressed(
-        npz_path,
-        attention=attention,
-        enhanced_attention=enhanced_attention,
-        token_ids=np.array(trace["token_ids"], dtype=np.int64),
-        token_texts=np.array(trace["token_texts"]),
-        query_token_ids=np.array(trace["query_token_ids"], dtype=np.int64),
-        query_token_texts=np.array(trace["query_token_texts"]),
-        audio_token_times_sec=audio_token_times,
-        audio_seconds=np.array(audio_seconds, dtype=np.float32),
-    )
+    npz_payload = {
+        "attention": attention,
+        "enhanced_attention": enhanced_attention,
+        "token_ids": np.array(trace["token_ids"], dtype=np.int64),
+        "token_texts": np.array(trace["token_texts"]),
+        "query_token_ids": np.array(trace["query_token_ids"], dtype=np.int64),
+        "query_token_texts": np.array(trace["query_token_texts"]),
+        "audio_token_times_sec": audio_token_times,
+        "audio_seconds": np.array(audio_seconds, dtype=np.float32),
+    }
+    if layer_attention_stack is not None:
+        npz_payload["layer_labels"] = np.array(layer_labels, dtype=np.int64)
+        npz_payload["layer_attention"] = layer_attention_stack
+        npz_payload["layer_enhanced_attention"] = layer_enhanced_attention_stack
+    np.savez_compressed(npz_path, **npz_payload)
 
     display_attention, bin_starts, bin_ends = _bin_attention(
         enhanced_attention,
         max_audio_bins=args.max_audio_bins,
     )
-    _write_html(html_path, metadata, display_attention, bin_starts, bin_ends)
+    _write_html(
+        html_path,
+        metadata,
+        display_attention,
+        bin_starts,
+        bin_ends,
+        layer_display_attentions=layer_display_attentions,
+    )
 
     print(
         json.dumps(
@@ -619,6 +731,11 @@ def main():
         "--no_overlay_ridge",
         action="store_true",
         help="Disable the monotonic row-peak ridge overlay in the HTML heatmap.",
+    )
+    parser.add_argument(
+        "--no_html_layer_controls",
+        action="store_true",
+        help="Disable per-layer On/Off controls in the HTML heatmap.",
     )
     parser.add_argument(
         "--audio_duration",
