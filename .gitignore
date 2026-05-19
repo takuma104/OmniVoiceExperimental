@@ -31,3 +31,7 @@ examples/exp*/
 output/
 output
 wandb/
+attention_out/
+timestamp_vis*/
+output_asr/
+output_asr
