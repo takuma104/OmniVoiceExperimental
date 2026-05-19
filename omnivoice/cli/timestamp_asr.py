@@ -5,7 +5,7 @@ import argparse
 import json
 import logging
 from pathlib import Path
-from typing import Iterator, Optional
+from typing import Any, Iterable, Iterator, Optional
 
 import numpy as np
 import torch
@@ -28,6 +28,50 @@ def _iter_samples(data_lst: str) -> Iterator[dict]:
     manifests = webdataset_manifest_reader(data_lst)
     reader = WebDatasetReader(manifests=manifests, evaluation=True)
     return iter(reader)
+
+
+def _sample_audio_length(sample: dict) -> int:
+    audio_tokens = sample["audio_tokens"]
+    if audio_tokens.dim() == 3 and audio_tokens.size(0) == 1:
+        audio_tokens = audio_tokens.squeeze(0)
+    return int(audio_tokens.size(-1))
+
+
+def _iter_windows(
+    samples: Iterable[dict],
+    window_size: int,
+    limit: Optional[int],
+) -> Iterator[list[dict[str, Any]]]:
+    window = []
+    count = 0
+    for sample in samples:
+        if limit is not None and count >= limit:
+            break
+        window.append(
+            {
+                "order": count,
+                "sample": sample,
+                "audio_length": _sample_audio_length(sample),
+            }
+        )
+        count += 1
+        if len(window) >= window_size:
+            yield window
+            window = []
+    if window:
+        yield window
+
+
+def _iter_batch_chunks(
+    window: list[dict[str, Any]],
+    batch_size: int,
+    use_bucketing: bool,
+) -> Iterator[list[dict[str, Any]]]:
+    items = window
+    if use_bucketing:
+        items = sorted(window, key=lambda item: item["audio_length"])
+    for start in range(0, len(items), batch_size):
+        yield items[start : start + batch_size]
 
 
 def _audio_duration_seconds(
@@ -223,6 +267,55 @@ def _build_timestamp_tokens(
     return token_items
 
 
+def _build_output_item(
+    trace: dict,
+    label: dict,
+    language: Optional[str],
+    args: argparse.Namespace,
+) -> dict:
+    raw_attention = trace["audio_attention"].numpy()
+    enhanced_attention = _enhance_attention_for_alignment(
+        attention=raw_attention,
+        mode=args.enhance,
+        baseline_quantile=args.enhance_baseline_quantile,
+        power=args.enhance_power,
+        smooth_radius=args.enhance_smooth_radius,
+    )
+    timestamp_attention = _repair_empty_attention_rows(
+        enhanced_attention=enhanced_attention,
+        raw_attention=raw_attention,
+    )
+    audio_seconds = _audio_duration_seconds(
+        label=label,
+        audio_num_tokens=int(trace["audio_num_tokens"]),
+        audio_duration=args.audio_duration,
+        audio_frame_rate=args.audio_frame_rate,
+    )
+    tokens = _build_timestamp_tokens(
+        trace=trace,
+        attention=timestamp_attention,
+        audio_seconds=audio_seconds,
+        args=args,
+    )
+
+    item = {
+        "id": label.get("id"),
+        "language_id": language,
+        "text": trace["text"],
+        "audio_num_tokens": int(trace["audio_num_tokens"]),
+        "audio_seconds": audio_seconds,
+        "timestamp_span_semantics": "[start_audio_token, end_audio_token)",
+        "timestamp_method": args.timestamp_method,
+        "layers": args.layers,
+        "heads": args.heads,
+        "enhance": args.enhance,
+        "tokens": tokens,
+    }
+    if args.include_reference:
+        item["reference"] = label.get("text")
+    return item
+
+
 def timestamp_asr(args):
     logging.basicConfig(
         format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
@@ -232,6 +325,10 @@ def timestamp_asr(args):
 
     if args.limit is not None and args.limit < 0:
         raise ValueError("--limit must be >= 0")
+    if args.batch_size < 1:
+        raise ValueError("--batch_size must be >= 1")
+    if args.bucket_size < 0:
+        raise ValueError("--bucket_size must be >= 0")
     if args.max_step_ratio < 0:
         raise ValueError("--max_step_ratio must be >= 0")
     if args.transition_penalty < 0:
@@ -244,6 +341,9 @@ def timestamp_asr(args):
         raise ValueError("--enhance_smooth_radius must be >= 0")
     if args.enhance_power <= 0:
         raise ValueError("--enhance_power must be > 0")
+
+    use_bucketing = args.bucket_size > args.batch_size
+    window_size = args.bucket_size if use_bucketing else args.batch_size
 
     device = args.device
     if device == "auto":
@@ -269,94 +369,156 @@ def timestamp_asr(args):
     count = 0
     errors = 0
     progress = tqdm(
-        _iter_samples(args.data_lst),
         total=args.limit,
         disable=args.no_progress,
         unit="sample",
     )
 
     try:
-        for sample in progress:
-            if args.limit is not None and count >= args.limit:
-                break
+        for window in _iter_windows(
+            _iter_samples(args.data_lst),
+            window_size,
+            args.limit,
+        ):
+            window_outputs: dict[int, dict] = {}
+            for batch_items in _iter_batch_chunks(
+                window,
+                args.batch_size,
+                use_bucketing,
+            ):
+                original_batch_len = len(batch_items)
+                samples = [item["sample"] for item in batch_items]
+                labels = [sample["label"] for sample in samples]
 
-            label = sample["label"]
-            try:
-                if "audio_tokens" not in sample:
-                    raise ValueError("Sample does not contain precomputed audio_tokens.")
+                valid_batch_items = []
+                valid_samples = []
+                valid_labels = []
+                for item_info, label, sample in zip(batch_items, labels, samples):
+                    if "audio_tokens" not in sample:
+                        message = (
+                            f"Sample {label.get('id')} does not contain "
+                            "precomputed audio_tokens."
+                        )
+                        if not args.continue_on_error:
+                            raise ValueError(message)
+                        window_outputs[item_info["order"]] = {
+                            "id": label.get("id"),
+                            "error": message,
+                        }
+                        errors += 1
+                        count += 1
+                        continue
+                    valid_batch_items.append(item_info)
+                    valid_samples.append(sample)
+                    valid_labels.append(label)
 
-                language = (
+                batch_items = valid_batch_items
+                samples = valid_samples
+                labels = valid_labels
+                if not batch_items:
+                    progress.update(original_batch_len)
+                    progress.set_postfix({"written": count, "errors": errors})
+                    continue
+
+                languages = [
                     args.language
                     if args.language is not None
                     else label.get("language_id")
-                )
-                trace = model.generate_text_attention_trace(
-                    audio_tokens=sample["audio_tokens"],
-                    tokenizer=tokenizer,
-                    language=language,
-                    max_new_tokens=args.max_new_tokens,
-                    temperature=args.temperature,
-                    layers=args.layers,
-                    heads=args.heads,
-                    include_eos=args.include_eos,
-                )
-                raw_attention = trace["audio_attention"].numpy()
-                enhanced_attention = _enhance_attention_for_alignment(
-                    attention=raw_attention,
-                    mode=args.enhance,
-                    baseline_quantile=args.enhance_baseline_quantile,
-                    power=args.enhance_power,
-                    smooth_radius=args.enhance_smooth_radius,
-                )
-                timestamp_attention = _repair_empty_attention_rows(
-                    enhanced_attention=enhanced_attention,
-                    raw_attention=raw_attention,
-                )
-                audio_seconds = _audio_duration_seconds(
-                    label=label,
-                    audio_num_tokens=int(trace["audio_num_tokens"]),
-                    audio_duration=args.audio_duration,
-                    audio_frame_rate=args.audio_frame_rate,
-                )
-                tokens = _build_timestamp_tokens(
-                    trace=trace,
-                    attention=timestamp_attention,
-                    audio_seconds=audio_seconds,
-                    args=args,
-                )
+                    for label in labels
+                ]
 
-                item = {
-                    "id": label.get("id"),
-                    "language_id": language,
-                    "text": trace["text"],
-                    "audio_num_tokens": int(trace["audio_num_tokens"]),
-                    "audio_seconds": audio_seconds,
-                    "timestamp_span_semantics": "[start_audio_token, end_audio_token)",
-                    "timestamp_method": args.timestamp_method,
-                    "layers": args.layers,
-                    "heads": args.heads,
-                    "enhance": args.enhance,
-                    "tokens": tokens,
-                }
-                if args.include_reference:
-                    item["reference"] = label.get("text")
-                print(json.dumps(item, ensure_ascii=False), file=output_file, flush=True)
-                count += 1
-            except Exception as exc:
-                errors += 1
-                if not args.continue_on_error:
-                    raise
-                error_item = {
-                    "id": label.get("id"),
-                    "error": str(exc),
-                }
+                try:
+                    traces = model.generate_text_attention_trace_batch(
+                        audio_tokens=[sample["audio_tokens"] for sample in samples],
+                        tokenizer=tokenizer,
+                        languages=languages,
+                        max_new_tokens=args.max_new_tokens,
+                        temperature=args.temperature,
+                        layers=args.layers,
+                        heads=args.heads,
+                        include_eos=args.include_eos,
+                    )
+                except Exception:
+                    if not args.continue_on_error:
+                        raise
+                    if device.startswith("cuda") and torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    traces = []
+                    for sample, label, language in zip(samples, labels, languages):
+                        try:
+                            trace = model.generate_text_attention_trace(
+                                audio_tokens=sample["audio_tokens"],
+                                tokenizer=tokenizer,
+                                language=language,
+                                max_new_tokens=args.max_new_tokens,
+                                temperature=args.temperature,
+                                layers=args.layers,
+                                heads=args.heads,
+                                include_eos=args.include_eos,
+                            )
+                        except Exception as exc:
+                            traces.append(
+                                {
+                                    "error": str(exc),
+                                    "id": label.get("id"),
+                                }
+                            )
+                        else:
+                            traces.append(trace)
+
+                if len(traces) != len(samples):
+                    message = (
+                        f"Expected {len(samples)} traces from batch generation, "
+                        f"got {len(traces)}."
+                    )
+                    if not args.continue_on_error:
+                        raise RuntimeError(message)
+                    traces = [
+                        {
+                            "id": label.get("id"),
+                            "error": message,
+                        }
+                        for label in labels
+                    ]
+
+                for item_info, label, language, trace in zip(
+                    batch_items,
+                    labels,
+                    languages,
+                    traces,
+                ):
+                    try:
+                        if "error" in trace:
+                            raise RuntimeError(trace["error"])
+                        output_item = _build_output_item(
+                            trace=trace,
+                            label=label,
+                            language=language,
+                            args=args,
+                        )
+                    except Exception as exc:
+                        errors += 1
+                        if not args.continue_on_error:
+                            raise
+                        output_item = {
+                            "id": label.get("id"),
+                            "error": str(exc),
+                        }
+                    window_outputs[item_info["order"]] = output_item
+                    count += 1
+
+                progress.update(original_batch_len)
+                progress.set_postfix({"written": count, "errors": errors})
+
+            for order in sorted(window_outputs):
                 print(
-                    json.dumps(error_item, ensure_ascii=False),
+                    json.dumps(
+                        window_outputs[order],
+                        ensure_ascii=False,
+                    ),
                     file=output_file,
                     flush=True,
                 )
-                count += 1
-            progress.set_postfix({"written": count, "errors": errors})
     finally:
         progress.close()
         output_file.close()
@@ -375,6 +537,24 @@ def main():
     parser.add_argument("--data_lst", required=True, help="WebDataset data.lst path")
     parser.add_argument("--output_jsonl", required=True, help="Output JSONL path")
     parser.add_argument("--limit", type=int, default=None, help="Max samples to process")
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=4,
+        help=(
+            "Number of samples per attention-trace generation batch. Attention "
+            "weights are memory-heavy, so this default is smaller than plain ASR."
+        ),
+    )
+    parser.add_argument(
+        "--bucket_size",
+        type=int,
+        default=64,
+        help=(
+            "Sort samples by audio token length within this many input samples "
+            "before batching. Set 0 to disable."
+        ),
+    )
     parser.add_argument("--max_new_tokens", type=int, default=256)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument(
