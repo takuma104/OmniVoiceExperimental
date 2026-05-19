@@ -25,6 +25,8 @@ logger = logging.getLogger(__name__)
 @dataclass
 class OmniVoiceASROutput(ModelOutput):
     loss: Optional[torch.Tensor] = None
+    text_loss: Optional[torch.Tensor] = None
+    timestamp_loss: Optional[torch.Tensor] = None
     logits: Optional[torch.Tensor] = None
     past_key_values: Optional[object] = None
     attentions: Optional[object] = None
@@ -96,6 +98,15 @@ class OmniVoiceForSpeechRecognition(PreTrainedModel):
             )
         else:
             self.audio_codebook_weights = None
+
+        timestamp_head_dim = getattr(self.config, "asr_timestamp_head_dim", 256)
+        self.config.asr_timestamp_head_dim = timestamp_head_dim
+        self.timestamp_query_proj = nn.Linear(hidden_size, timestamp_head_dim, bias=False)
+        self.timestamp_audio_key_proj = nn.Linear(
+            hidden_size,
+            timestamp_head_dim,
+            bias=False,
+        )
 
         self.asr_attention_mode = attention_mode or getattr(
             self.config, "asr_attention_mode", "prefix_lm"
@@ -207,6 +218,7 @@ class OmniVoiceForSpeechRecognition(PreTrainedModel):
         freeze_text_head: bool = True,
         freeze_audio_embeddings: bool = True,
         train_audio_embedding_adapter: bool = True,
+        train_timestamp_head: bool = True,
     ):
         for p in self.parameters():
             p.requires_grad = False
@@ -238,6 +250,12 @@ class OmniVoiceForSpeechRecognition(PreTrainedModel):
         for p in self.audio_heads.parameters():
             p.requires_grad = False
 
+        if train_timestamp_head:
+            for p in self.timestamp_query_proj.parameters():
+                p.requires_grad = True
+            for p in self.timestamp_audio_key_proj.parameters():
+                p.requires_grad = True
+
     @classmethod
     def from_omnivoice_pretrained(
         cls,
@@ -245,6 +263,7 @@ class OmniVoiceForSpeechRecognition(PreTrainedModel):
         audio_embedding_mode: Optional[str] = None,
         audio_adapter_hidden_size: Optional[int] = None,
         attention_mode: Optional[str] = None,
+        timestamp_head_dim: Optional[int] = None,
         **kwargs,
     ):
         base = OmniVoice.from_pretrained(
@@ -252,6 +271,8 @@ class OmniVoiceForSpeechRecognition(PreTrainedModel):
             train=True,
             **kwargs,
         )
+        if timestamp_head_dim is not None:
+            base.config.asr_timestamp_head_dim = timestamp_head_dim
         return cls(
             config=base.config,
             omnivoice=base,
@@ -375,6 +396,7 @@ class OmniVoiceForSpeechRecognition(PreTrainedModel):
         past_key_values: Optional[object] = None,
         use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
+        timestamp_center_labels: Optional[torch.LongTensor] = None,
     ):
         inputs_embeds = self._prepare_embed_inputs(input_ids, audio_mask)
 
@@ -403,22 +425,104 @@ class OmniVoiceForSpeechRecognition(PreTrainedModel):
         hidden_states = llm_outputs[0]
         logits = self.text_head(hidden_states)
 
-        loss = None
+        text_loss = None
         if labels is not None:
             shift_logits = logits[:, :-1, :].contiguous()
             shift_labels = labels[:, 1:].contiguous()
-            loss = F.cross_entropy(
+            text_loss = F.cross_entropy(
                 shift_logits.view(-1, shift_logits.size(-1)),
                 shift_labels.view(-1),
                 ignore_index=-100,
             )
 
+        timestamp_loss = None
+        if timestamp_center_labels is not None:
+            timestamp_loss = self._compute_timestamp_center_loss(
+                hidden_states=hidden_states,
+                timestamp_center_labels=timestamp_center_labels,
+                audio_mask=audio_mask,
+                document_ids=document_ids,
+            )
+
+        loss = text_loss
+        if timestamp_loss is not None:
+            weight = getattr(self.config, "asr_timestamp_loss_weight", 1.0)
+            if loss is None:
+                loss = timestamp_loss * weight
+            else:
+                loss = loss + timestamp_loss * weight
+
         return OmniVoiceASROutput(
             loss=loss,
+            text_loss=text_loss,
+            timestamp_loss=timestamp_loss,
             logits=logits,
             past_key_values=getattr(llm_outputs, "past_key_values", None),
             attentions=getattr(llm_outputs, "attentions", None),
         )
+
+    def _compute_timestamp_center_loss(
+        self,
+        hidden_states: torch.Tensor,
+        timestamp_center_labels: torch.Tensor,
+        audio_mask: torch.Tensor,
+        document_ids: Optional[torch.Tensor],
+    ) -> Optional[torch.Tensor]:
+        if document_ids is None:
+            raise ValueError("timestamp_center_labels requires document_ids.")
+
+        labels = timestamp_center_labels.to(device=hidden_states.device)
+        audio_mask = audio_mask.to(device=hidden_states.device, dtype=torch.bool)
+        document_ids = document_ids.to(device=hidden_states.device)
+        valid_query_mask = labels >= 0
+        if not torch.any(valid_query_mask):
+            return (
+                self.timestamp_query_proj.weight.sum()
+                + self.timestamp_audio_key_proj.weight.sum()
+            ) * 0.0
+
+        losses = []
+        scale = self.timestamp_query_proj.out_features**-0.5
+        for batch_idx in range(hidden_states.size(0)):
+            batch_doc_ids = document_ids[batch_idx]
+            batch_labels = labels[batch_idx]
+            batch_valid = valid_query_mask[batch_idx]
+            doc_values = torch.unique(batch_doc_ids[batch_valid])
+            for doc_id in doc_values.tolist():
+                if doc_id < 0:
+                    continue
+                doc_mask = batch_doc_ids == doc_id
+                audio_positions = torch.nonzero(
+                    doc_mask & audio_mask[batch_idx],
+                    as_tuple=False,
+                ).squeeze(1)
+                if audio_positions.numel() == 0:
+                    continue
+
+                query_positions = torch.nonzero(
+                    doc_mask & batch_valid,
+                    as_tuple=False,
+                ).squeeze(1)
+                targets = batch_labels[query_positions].long()
+                target_mask = (targets >= 0) & (targets < audio_positions.numel())
+                if not torch.any(target_mask):
+                    continue
+
+                query_positions = query_positions[target_mask]
+                targets = targets[target_mask]
+                query_states = hidden_states[batch_idx, query_positions]
+                audio_states = hidden_states[batch_idx, audio_positions]
+                query = self.timestamp_query_proj(query_states)
+                keys = self.timestamp_audio_key_proj(audio_states)
+                pointer_logits = torch.matmul(query, keys.transpose(0, 1)) * scale
+                losses.append(F.cross_entropy(pointer_logits, targets))
+
+        if not losses:
+            return (
+                self.timestamp_query_proj.weight.sum()
+                + self.timestamp_audio_key_proj.weight.sum()
+            ) * 0.0
+        return torch.stack(losses).mean()
 
     @staticmethod
     def _resolve_attention_indices(

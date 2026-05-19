@@ -27,6 +27,7 @@ Contains two processor classes:
 """
 
 import random
+from difflib import SequenceMatcher
 from typing import Any, Dict
 
 import torch
@@ -268,10 +269,14 @@ class OmniVoiceASRSampleProcessor:
         text_tokenizer: Any,
         num_channels: int,
         language_ratio: float = 1.0,
+        timestamp_enabled: bool = False,
+        timestamp_min_confidence: float = 0.0,
     ):
         self.text_tokenizer = text_tokenizer
         self.num_channels = num_channels
         self.language_ratio = language_ratio
+        self.timestamp_enabled = timestamp_enabled
+        self.timestamp_min_confidence = timestamp_min_confidence
 
     def __call__(self, sample: Dict[str, Any]) -> Dict[str, Any]:
         label = sample["label"]
@@ -317,10 +322,76 @@ class OmniVoiceASRSampleProcessor:
         # following text positions are predicted autoregressively.
         labels[text_start_idx + 1 :] = text_ids.squeeze(0)[1:]
 
-        return {
+        return_dict = {
             "input_ids": input_ids,  # [C, L]
             "labels": labels,  # [L]
             "audio_mask": audio_mask,  # [L]
             "text_causal_mask": text_causal_mask,  # [L]
             "length": total_length,
         }
+
+        timestamp = sample.get("timestamp")
+        if timestamp is not None:
+            return_dict["timestamp_center_labels"] = (
+                self._build_timestamp_center_labels(
+                    timestamp=timestamp,
+                    text_token_ids=text_ids.squeeze(0)[1:-1].tolist(),
+                    text_start_idx=text_start_idx,
+                    total_length=total_length,
+                    audio_num_tokens=audio_tokens.shape[1],
+                )
+            )
+        elif self.timestamp_enabled:
+            return_dict["timestamp_center_labels"] = torch.full(
+                (total_length,),
+                -100,
+                dtype=torch.long,
+            )
+
+        return return_dict
+
+    def _build_timestamp_center_labels(
+        self,
+        timestamp: Dict[str, Any],
+        text_token_ids: list[int],
+        text_start_idx: int,
+        total_length: int,
+        audio_num_tokens: int,
+    ) -> torch.Tensor:
+        labels = torch.full((total_length,), -100, dtype=torch.long)
+        timestamp_tokens = timestamp.get("tokens") or []
+        timestamp_token_pairs = [
+            (idx, int(token_item["token_id"]))
+            for idx, token_item in enumerate(timestamp_tokens)
+            if token_item.get("token_id") is not None
+        ]
+        timestamp_token_ids = [token_id for _, token_id in timestamp_token_pairs]
+        matcher = SequenceMatcher(
+            a=text_token_ids,
+            b=timestamp_token_ids,
+            autojunk=False,
+        )
+
+        for block in matcher.get_matching_blocks():
+            for offset in range(block.size):
+                text_idx = block.a + offset
+                timestamp_idx = timestamp_token_pairs[block.b + offset][0]
+                token_item = timestamp_tokens[timestamp_idx]
+
+                confidence = token_item.get("confidence")
+                if (
+                    confidence is not None
+                    and float(confidence) < self.timestamp_min_confidence
+                ):
+                    continue
+
+                center = token_item.get("center_audio_token")
+                if center is None:
+                    continue
+                center = int(center)
+                if center < 0 or center >= audio_num_tokens:
+                    continue
+
+                labels[text_start_idx + text_idx] = center
+
+        return labels

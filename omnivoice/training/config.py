@@ -67,6 +67,11 @@ class TrainingConfig:
     asr_freeze_text_embedding: bool = True
     asr_freeze_text_head: bool = True
     asr_freeze_audio_embeddings: bool = True
+    asr_enable_timestamp_head: bool = False
+    asr_train_timestamp_head: bool = True
+    asr_timestamp_loss_weight: float = 1.0
+    asr_timestamp_head_dim: int = 256
+    asr_timestamp_min_confidence: float = 0.0
 
     # Training Hyperparams
     learning_rate: float = 1e-4

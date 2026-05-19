@@ -112,6 +112,20 @@ class ASRPackingDataCollator:
         text_causal_mask = torch.cat(
             [s["text_causal_mask"] for s in processed_samples], dim=0
         )
+        has_timestamp_labels = any(
+            "timestamp_center_labels" in s for s in processed_samples
+        )
+        if has_timestamp_labels:
+            timestamp_center_labels = torch.cat(
+                [
+                    s.get(
+                        "timestamp_center_labels",
+                        torch.full((s["length"],), -100, dtype=torch.long),
+                    )
+                    for s in processed_samples
+                ],
+                dim=0,
+            )
 
         position_ids = torch.cat(
             [torch.arange(s["length"], dtype=torch.long) for s in processed_samples],
@@ -132,6 +146,12 @@ class ASRPackingDataCollator:
         text_causal_mask = torch.nn.functional.pad(
             text_causal_mask, pad=(0, pad_length), value=False
         )
+        if has_timestamp_labels:
+            timestamp_center_labels = torch.nn.functional.pad(
+                timestamp_center_labels,
+                pad=(0, pad_length),
+                value=-100,
+            )
         position_ids = torch.nn.functional.pad(
             position_ids, pad=(0, pad_length), value=0
         )
@@ -146,7 +166,7 @@ class ASRPackingDataCollator:
             document_ids, pad=(0, pad_length), value=-1
         )
 
-        return {
+        return_dict = {
             "input_ids": input_ids.unsqueeze(0),  # [1, C, L]
             "labels": labels.unsqueeze(0),  # [1, L]
             "audio_mask": audio_mask.unsqueeze(0),  # [1, L]
@@ -154,3 +174,6 @@ class ASRPackingDataCollator:
             "position_ids": position_ids.unsqueeze(0),  # [1, L]
             "document_ids": document_ids.unsqueeze(0),  # [1, L]
         }
+        if has_timestamp_labels:
+            return_dict["timestamp_center_labels"] = timestamp_center_labels.unsqueeze(0)
+        return return_dict

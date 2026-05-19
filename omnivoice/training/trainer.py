@@ -331,6 +331,8 @@ class OmniTrainer:
         logger.info(f"Running evaluation at step {self.global_step}...")
 
         local_loss_sum = torch.tensor(0.0, device=self.accelerator.device)
+        local_text_loss_sum = torch.tensor(0.0, device=self.accelerator.device)
+        local_timestamp_loss_sum = torch.tensor(0.0, device=self.accelerator.device)
         eval_count = 0
 
         with torch.no_grad():
@@ -338,6 +340,10 @@ class OmniTrainer:
                 eval_batch = _to_device(eval_batch, self.accelerator.device)
                 outputs = self.model(**eval_batch)
                 local_loss_sum += outputs.loss.detach()
+                if getattr(outputs, "text_loss", None) is not None:
+                    local_text_loss_sum += outputs.text_loss.detach()
+                if getattr(outputs, "timestamp_loss", None) is not None:
+                    local_timestamp_loss_sum += outputs.timestamp_loss.detach()
                 eval_count += 1
 
         if eval_count > 0:
@@ -349,6 +355,14 @@ class OmniTrainer:
         final_eval_loss = all_means.mean().item()
 
         eval_metrics = {"eval/loss": final_eval_loss}
+        if eval_count > 0:
+            eval_metrics["eval/text_loss"] = self.accelerator.gather(
+                local_text_loss_sum / eval_count
+            ).mean().item()
+        if eval_count > 0 and getattr(self.config, "asr_enable_timestamp_head", False):
+            eval_metrics["eval/timestamp_loss"] = self.accelerator.gather(
+                local_timestamp_loss_sum / eval_count
+            ).mean().item()
         self.accelerator.log(eval_metrics, step=self.global_step)
         logger.info(f"Eval Loss: {final_eval_loss:.4f}")
 
@@ -380,7 +394,11 @@ class OmniTrainer:
         logging_start_time = time.time()
         logging_start_step = self.global_step
         tr_loss = torch.tensor(0.0).to(self.accelerator.device)
+        tr_text_loss = torch.tensor(0.0).to(self.accelerator.device)
+        tr_timestamp_loss = torch.tensor(0.0).to(self.accelerator.device)
         logging_loss_scalar = 0.0
+        logging_text_loss_scalar = 0.0
+        logging_timestamp_loss_scalar = 0.0
         logging_text_tokens = 0
         logging_audio_tokens = 0
 
@@ -413,6 +431,10 @@ class OmniTrainer:
                 outputs = self.model(**batch)
                 loss = outputs.loss
                 tr_loss += loss.detach()
+                if getattr(outputs, "text_loss", None) is not None:
+                    tr_text_loss += outputs.text_loss.detach()
+                if getattr(outputs, "timestamp_loss", None) is not None:
+                    tr_timestamp_loss += outputs.timestamp_loss.detach()
                 self.accelerator.backward(loss)
 
                 if self.accelerator.sync_gradients:
@@ -452,9 +474,32 @@ class OmniTrainer:
                             * self.config.gradient_accumulation_steps
                         )
                         logging_loss_scalar = tr_loss_scalar
+                        tr_text_loss_scalar = (
+                            self.accelerator.gather(tr_text_loss).mean().item()
+                        )
+                        current_text_loss = (
+                            tr_text_loss_scalar - logging_text_loss_scalar
+                        )
+                        avg_text_loss = current_text_loss / (
+                            self.config.logging_steps
+                            * self.config.gradient_accumulation_steps
+                        )
+                        logging_text_loss_scalar = tr_text_loss_scalar
+                        tr_timestamp_loss_scalar = (
+                            self.accelerator.gather(tr_timestamp_loss).mean().item()
+                        )
+                        current_timestamp_loss = (
+                            tr_timestamp_loss_scalar - logging_timestamp_loss_scalar
+                        )
+                        avg_timestamp_loss = current_timestamp_loss / (
+                            self.config.logging_steps
+                            * self.config.gradient_accumulation_steps
+                        )
+                        logging_timestamp_loss_scalar = tr_timestamp_loss_scalar
 
                         logs = {
                             "train/loss": avg_loss,
+                            "train/text_loss": avg_text_loss,
                             "train/learning_rate": current_lr,
                             "train/grad_norm": grad_norm,
                             "train/epoch": self.epoch,
@@ -462,6 +507,8 @@ class OmniTrainer:
                             "train/text_tokens": logging_text_tokens,
                             "train/audio_tokens": logging_audio_tokens,
                         }
+                        if getattr(self.config, "asr_enable_timestamp_head", False):
+                            logs["train/timestamp_loss"] = avg_timestamp_loss
                         train_logger.log_metrics(step=self.global_step, metrics=logs)
 
                         logging_start_time = time.time()
