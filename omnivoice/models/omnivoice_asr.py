@@ -461,6 +461,25 @@ class OmniVoiceForSpeechRecognition(PreTrainedModel):
         layers: Optional[Union[str, int, Sequence[int]]],
         heads: Optional[Union[str, int, Sequence[int]]],
     ) -> torch.Tensor:
+        _, per_layer = self._audio_attention_per_layer(
+            attentions=attentions,
+            query_index=query_index,
+            audio_start=audio_start,
+            audio_end=audio_end,
+            layers=layers,
+            heads=heads,
+        )
+        return self._combine_layer_audio_attention(per_layer)
+
+    def _audio_attention_per_layer(
+        self,
+        attentions: object,
+        query_index: int,
+        audio_start: int,
+        audio_end: int,
+        layers: Optional[Union[str, int, Sequence[int]]],
+        heads: Optional[Union[str, int, Sequence[int]]],
+    ) -> tuple[List[int], List[torch.Tensor]]:
         if attentions is None:
             raise RuntimeError(
                 "The LLM did not return attentions. Load the model with "
@@ -489,8 +508,15 @@ class OmniVoiceForSpeechRecognition(PreTrainedModel):
                 query_index,
                 audio_start:audio_end,
             ]
-            per_layer.append(query_attention.float().mean(dim=0))
+            scores = query_attention.float().mean(dim=0)
+            total = scores.sum()
+            if torch.isfinite(total) and total > 0:
+                scores = scores / total
+            per_layer.append(scores)
+        return layer_indices, per_layer
 
+    @staticmethod
+    def _combine_layer_audio_attention(per_layer: Sequence[torch.Tensor]) -> torch.Tensor:
         scores = torch.stack(per_layer, dim=0).mean(dim=0)
         total = scores.sum()
         if torch.isfinite(total) and total > 0:
@@ -508,6 +534,7 @@ class OmniVoiceForSpeechRecognition(PreTrainedModel):
         layers: Optional[Union[str, int, Sequence[int]]] = "last",
         heads: Optional[Union[str, int, Sequence[int]]] = None,
         include_eos: bool = False,
+        return_layer_attentions: bool = False,
     ) -> dict[str, Any]:
         """Generate one transcript and collect audio-prefix attention per step.
 
@@ -578,6 +605,7 @@ class OmniVoiceForSpeechRecognition(PreTrainedModel):
         query_token_ids: List[int] = []
         query_token_texts: List[str] = []
         audio_attention_rows: List[torch.Tensor] = []
+        layer_audio_attention_rows: dict[int, List[torch.Tensor]] = {}
         prompt_valid_mask = torch.ones(1, seq_len, dtype=torch.bool, device=device)
         lengths_tensor = torch.tensor([seq_len], dtype=torch.long, device=device)
 
@@ -586,8 +614,8 @@ class OmniVoiceForSpeechRecognition(PreTrainedModel):
             token_id = int(next_id.item())
 
             if token_id != eos_id or include_eos:
-                audio_attention_rows.append(
-                    self._aggregate_audio_attention(
+                if return_layer_attentions:
+                    layer_indices, per_layer = self._audio_attention_per_layer(
                         attentions=current_attentions,
                         query_index=current_query_index,
                         audio_start=audio_start,
@@ -595,7 +623,24 @@ class OmniVoiceForSpeechRecognition(PreTrainedModel):
                         layers=layers,
                         heads=heads,
                     )
-                )
+                    audio_attention_rows.append(
+                        self._combine_layer_audio_attention(per_layer)
+                    )
+                    for layer_index, layer_scores in zip(layer_indices, per_layer):
+                        layer_audio_attention_rows.setdefault(layer_index, []).append(
+                            layer_scores.detach().cpu()
+                        )
+                else:
+                    audio_attention_rows.append(
+                        self._aggregate_audio_attention(
+                            attentions=current_attentions,
+                            query_index=current_query_index,
+                            audio_start=audio_start,
+                            audio_end=audio_end,
+                            layers=layers,
+                            heads=heads,
+                        )
+                    )
                 token_ids.append(token_id)
                 token_texts.append(
                     tokenizer.decode([token_id], skip_special_tokens=False)
@@ -644,6 +689,15 @@ class OmniVoiceForSpeechRecognition(PreTrainedModel):
         else:
             audio_attention = torch.empty(0, sample.size(1), dtype=torch.float32)
 
+        layer_audio_attentions = None
+        if return_layer_attentions:
+            layer_audio_attentions = {
+                layer_index: torch.stack(rows, dim=0)
+                if rows
+                else torch.empty(0, sample.size(1), dtype=torch.float32)
+                for layer_index, rows in layer_audio_attention_rows.items()
+            }
+
         return {
             "text": tokenizer.decode(generated, skip_special_tokens=True).strip(),
             "token_ids": token_ids,
@@ -651,6 +705,7 @@ class OmniVoiceForSpeechRecognition(PreTrainedModel):
             "query_token_ids": query_token_ids,
             "query_token_texts": query_token_texts,
             "audio_attention": audio_attention,
+            "layer_audio_attentions": layer_audio_attentions,
             "audio_start": audio_start,
             "audio_end": audio_end,
             "audio_num_tokens": sample.size(1),
