@@ -24,6 +24,14 @@ from omnivoice.models.omnivoice_asr import OmniVoiceForSpeechRecognition
 logger = logging.getLogger(__name__)
 
 
+def _resolve_attn_implementation(attn_implementation: str, timestamp_source: str) -> str:
+    if attn_implementation != "auto":
+        return attn_implementation
+    if timestamp_source == "pointer":
+        return "sdpa"
+    return "eager"
+
+
 def _iter_samples(data_lst: str) -> Iterator[dict]:
     manifests = webdataset_manifest_reader(data_lst)
     reader = WebDatasetReader(manifests=manifests, evaluation=True)
@@ -274,17 +282,20 @@ def _build_output_item(
     args: argparse.Namespace,
 ) -> dict:
     raw_attention = trace["audio_attention"].numpy()
-    enhanced_attention = _enhance_attention_for_alignment(
-        attention=raw_attention,
-        mode=args.enhance,
-        baseline_quantile=args.enhance_baseline_quantile,
-        power=args.enhance_power,
-        smooth_radius=args.enhance_smooth_radius,
-    )
-    timestamp_attention = _repair_empty_attention_rows(
-        enhanced_attention=enhanced_attention,
-        raw_attention=raw_attention,
-    )
+    if args.timestamp_source == "pointer":
+        timestamp_attention = raw_attention
+    else:
+        enhanced_attention = _enhance_attention_for_alignment(
+            attention=raw_attention,
+            mode=args.enhance,
+            baseline_quantile=args.enhance_baseline_quantile,
+            power=args.enhance_power,
+            smooth_radius=args.enhance_smooth_radius,
+        )
+        timestamp_attention = _repair_empty_attention_rows(
+            enhanced_attention=enhanced_attention,
+            raw_attention=raw_attention,
+        )
     audio_seconds = _audio_duration_seconds(
         label=label,
         audio_num_tokens=int(trace["audio_num_tokens"]),
@@ -305,12 +316,14 @@ def _build_output_item(
         "audio_num_tokens": int(trace["audio_num_tokens"]),
         "audio_seconds": audio_seconds,
         "timestamp_span_semantics": "[start_audio_token, end_audio_token)",
+        "timestamp_source": args.timestamp_source,
         "timestamp_method": args.timestamp_method,
-        "layers": args.layers,
-        "heads": args.heads,
-        "enhance": args.enhance,
         "tokens": tokens,
     }
+    if args.timestamp_source == "attention":
+        item["layers"] = args.layers
+        item["heads"] = args.heads
+        item["enhance"] = args.enhance
     if args.include_reference:
         item["reference"] = label.get("text")
     return item
@@ -349,7 +362,11 @@ def timestamp_asr(args):
     if device == "auto":
         device = _get_best_device()
     dtype = _resolve_dtype(args.dtype, device)
-    if args.attn_implementation != "eager":
+    attn_implementation = _resolve_attn_implementation(
+        args.attn_implementation,
+        args.timestamp_source,
+    )
+    if args.timestamp_source == "attention" and attn_implementation != "eager":
         logger.warning(
             "Timestamp extraction needs attention weights; eager attention is safest."
         )
@@ -357,7 +374,7 @@ def timestamp_asr(args):
     tokenizer = AutoTokenizer.from_pretrained(args.checkpoint)
     model = OmniVoiceForSpeechRecognition.from_pretrained(
         args.checkpoint,
-        attn_implementation=args.attn_implementation,
+        attn_implementation=attn_implementation,
         dtype=dtype,
     )
     model.to(device)
@@ -428,16 +445,30 @@ def timestamp_asr(args):
                 ]
 
                 try:
-                    traces = model.generate_text_attention_trace_batch(
-                        audio_tokens=[sample["audio_tokens"] for sample in samples],
-                        tokenizer=tokenizer,
-                        languages=languages,
-                        max_new_tokens=args.max_new_tokens,
-                        temperature=args.temperature,
-                        layers=args.layers,
-                        heads=args.heads,
-                        include_eos=args.include_eos,
-                    )
+                    if args.timestamp_source == "pointer":
+                        traces = model.generate_text_pointer_trace_batch(
+                            audio_tokens=[
+                                sample["audio_tokens"] for sample in samples
+                            ],
+                            tokenizer=tokenizer,
+                            languages=languages,
+                            max_new_tokens=args.max_new_tokens,
+                            temperature=args.temperature,
+                            include_eos=args.include_eos,
+                        )
+                    else:
+                        traces = model.generate_text_attention_trace_batch(
+                            audio_tokens=[
+                                sample["audio_tokens"] for sample in samples
+                            ],
+                            tokenizer=tokenizer,
+                            languages=languages,
+                            max_new_tokens=args.max_new_tokens,
+                            temperature=args.temperature,
+                            layers=args.layers,
+                            heads=args.heads,
+                            include_eos=args.include_eos,
+                        )
                 except Exception:
                     if not args.continue_on_error:
                         raise
@@ -446,16 +477,26 @@ def timestamp_asr(args):
                     traces = []
                     for sample, label, language in zip(samples, labels, languages):
                         try:
-                            trace = model.generate_text_attention_trace(
-                                audio_tokens=sample["audio_tokens"],
-                                tokenizer=tokenizer,
-                                language=language,
-                                max_new_tokens=args.max_new_tokens,
-                                temperature=args.temperature,
-                                layers=args.layers,
-                                heads=args.heads,
-                                include_eos=args.include_eos,
-                            )
+                            if args.timestamp_source == "pointer":
+                                trace = model.generate_text_pointer_trace_batch(
+                                    audio_tokens=[sample["audio_tokens"]],
+                                    tokenizer=tokenizer,
+                                    languages=[language],
+                                    max_new_tokens=args.max_new_tokens,
+                                    temperature=args.temperature,
+                                    include_eos=args.include_eos,
+                                )[0]
+                            else:
+                                trace = model.generate_text_attention_trace(
+                                    audio_tokens=sample["audio_tokens"],
+                                    tokenizer=tokenizer,
+                                    language=language,
+                                    max_new_tokens=args.max_new_tokens,
+                                    temperature=args.temperature,
+                                    layers=args.layers,
+                                    heads=args.heads,
+                                    include_eos=args.include_eos,
+                                )
                         except Exception as exc:
                             traces.append(
                                 {
@@ -542,8 +583,8 @@ def main():
         type=int,
         default=4,
         help=(
-            "Number of samples per attention-trace generation batch. Attention "
-            "weights are memory-heavy, so this default is smaller than plain ASR."
+            "Number of samples per timestamp generation batch. Attention mode is "
+            "memory-heavy, so this default is smaller than plain ASR."
         ),
     )
     parser.add_argument(
@@ -557,6 +598,15 @@ def main():
     )
     parser.add_argument("--max_new_tokens", type=int, default=256)
     parser.add_argument("--temperature", type=float, default=0.0)
+    parser.add_argument(
+        "--timestamp_source",
+        default="attention",
+        choices=["attention", "pointer"],
+        help=(
+            "Use attention weights or the trained timestamp pointer head. "
+            "Pointer mode does not require output_attentions."
+        ),
+    )
     parser.add_argument(
         "--layers",
         default="last",
@@ -635,8 +685,9 @@ def main():
     )
     parser.add_argument(
         "--attn_implementation",
-        default="eager",
-        choices=["eager", "sdpa", "flex_attention"],
+        default="auto",
+        choices=["auto", "eager", "sdpa", "flex_attention"],
+        help="auto uses eager for attention timestamps and sdpa for pointer timestamps.",
     )
     parser.add_argument(
         "--dtype",

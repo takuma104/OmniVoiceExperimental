@@ -373,6 +373,12 @@ class OmniVoiceForSpeechRecognition(PreTrainedModel):
             q_is_text = text_causal_mask[:, :, None]
             causal_text = q_is_text & (q_idx >= kv_idx)
             attention_mask = valid_doc & same_doc & (kv_is_prefix | causal_text)
+
+        # SDPA can produce NaNs for padding query rows whose whole key row is
+        # masked. Those rows are never read by the loss/generation code, but
+        # keeping a harmless self-edge prevents backend-specific NaN propagation.
+        padding_self = (document_ids[:, :, None] < 0) & (q_idx == kv_idx)
+        attention_mask = attention_mask | padding_self
         attention_mask = attention_mask.unsqueeze(1)
 
         if as_attention_bias:
@@ -1115,6 +1121,264 @@ class OmniVoiceForSpeechRecognition(PreTrainedModel):
                     "audio_num_tokens": audio_lengths_out[idx],
                     "layers": layers,
                     "heads": heads,
+                }
+            )
+        return traces
+
+    @torch.inference_mode()
+    def generate_text_pointer_trace_batch(
+        self,
+        audio_tokens: Union[torch.Tensor, Sequence[torch.Tensor]],
+        tokenizer: AutoTokenizer,
+        languages: Optional[Sequence[Optional[str]]] = None,
+        audio_lengths: Optional[Union[torch.Tensor, Sequence[int]]] = None,
+        max_new_tokens: int = 256,
+        temperature: float = 0.0,
+        include_eos: bool = False,
+    ) -> List[dict[str, Any]]:
+        """Batched ASR generation with timestamp-pointer probabilities per token."""
+        device = next(self.parameters()).device
+        c = self.config.num_audio_codebook
+        samples = self._normalize_generate_audio_batch(
+            audio_tokens=audio_tokens,
+            audio_lengths=audio_lengths,
+            num_codebooks=c,
+        )
+        if not samples:
+            return []
+
+        batch_size = len(samples)
+        if languages is None:
+            languages = [None] * batch_size
+        elif isinstance(languages, str):
+            languages = [languages] * batch_size
+        elif len(languages) != batch_size:
+            raise ValueError(
+                f"Expected {batch_size} language entries, got {len(languages)}."
+            )
+
+        text_start_ids = tokenizer("<|text_start|>", return_tensors="pt").input_ids.to(
+            device
+        )
+        eos_ids = tokenizer("<|text_end|>", return_tensors="pt").input_ids.to(device)
+        eos_id = eos_ids[0, -1].item()
+
+        sample_inputs = []
+        sample_audio_masks = []
+        sample_text_causal_masks = []
+        lengths = []
+        audio_starts = []
+        audio_ends = []
+        audio_lengths_out = []
+        for sample, language in zip(samples, languages):
+            sample = sample.to(device=device, dtype=torch.long)
+            style = "<|asr|>"
+            if language is not None:
+                style += f"<|lang_start|>{language}<|lang_end|>"
+            style_ids = tokenizer(style, return_tensors="pt").input_ids.to(device)
+
+            style_inputs = style_ids.repeat(c, 1)
+            text_inputs = text_start_ids.repeat(c, 1)
+            sample_input_ids = torch.cat([style_inputs, sample, text_inputs], dim=1)
+
+            audio_mask = torch.zeros(
+                sample_input_ids.size(1), dtype=torch.bool, device=device
+            )
+            audio_start = style_inputs.size(1)
+            audio_end = audio_start + sample.size(1)
+            audio_mask[audio_start:audio_end] = True
+
+            text_causal_mask = torch.zeros_like(audio_mask)
+            text_causal_mask[-text_inputs.size(1) :] = True
+
+            sample_inputs.append(sample_input_ids)
+            sample_audio_masks.append(audio_mask)
+            sample_text_causal_masks.append(text_causal_mask)
+            lengths.append(sample_input_ids.size(1))
+            audio_starts.append(audio_start)
+            audio_ends.append(audio_end)
+            audio_lengths_out.append(sample.size(1))
+
+        max_len = max(lengths)
+        input_ids = torch.zeros(
+            batch_size,
+            c,
+            max_len,
+            dtype=torch.long,
+            device=device,
+        )
+        audio_mask = torch.zeros(
+            batch_size,
+            max_len,
+            dtype=torch.bool,
+            device=device,
+        )
+        text_causal_mask = torch.zeros_like(audio_mask)
+        document_ids = torch.full(
+            (batch_size, max_len),
+            -1,
+            dtype=torch.int32,
+            device=device,
+        )
+        position_ids = torch.zeros(
+            batch_size,
+            max_len,
+            dtype=torch.long,
+            device=device,
+        )
+
+        for idx, (
+            sample_input_ids,
+            sample_audio_mask,
+            sample_text_causal_mask,
+        ) in enumerate(zip(sample_inputs, sample_audio_masks, sample_text_causal_masks)):
+            length = sample_input_ids.size(1)
+            input_ids[idx, :, :length] = sample_input_ids
+            audio_mask[idx, :length] = sample_audio_mask
+            text_causal_mask[idx, :length] = sample_text_causal_mask
+            document_ids[idx, :length] = 0
+            position_ids[idx, :length] = torch.arange(length, device=device)
+
+        lengths_tensor = torch.tensor(lengths, dtype=torch.long, device=device)
+        prompt_valid_mask = document_ids >= 0
+        batch_indices = torch.arange(batch_size, device=device)
+        last_indices = lengths_tensor - 1
+        finished = torch.zeros(batch_size, dtype=torch.bool, device=device)
+
+        generated: List[List[int]] = [[] for _ in range(batch_size)]
+        token_ids: List[List[int]] = [[] for _ in range(batch_size)]
+        token_texts: List[List[str]] = [[] for _ in range(batch_size)]
+        query_token_ids: List[List[int]] = [[] for _ in range(batch_size)]
+        query_token_texts: List[List[str]] = [[] for _ in range(batch_size)]
+        pointer_rows: List[List[torch.Tensor]] = [[] for _ in range(batch_size)]
+
+        outputs = self(
+            input_ids=input_ids,
+            audio_mask=audio_mask,
+            text_causal_mask=text_causal_mask,
+            document_ids=document_ids,
+            position_ids=position_ids,
+            use_cache=True,
+            return_hidden_states=True,
+        )
+        past_key_values = outputs.past_key_values
+        if past_key_values is None:
+            raise RuntimeError("LLM did not return past_key_values.")
+        hidden_states = outputs.hidden_states
+        if hidden_states is None:
+            raise RuntimeError("LLM did not return hidden states.")
+
+        logits = outputs.logits[batch_indices, last_indices, :]
+        audio_keys = [
+            self.timestamp_audio_key_proj(hidden_states[idx, start:end])
+            for idx, (start, end) in enumerate(zip(audio_starts, audio_ends))
+        ]
+        current_query_states = hidden_states[batch_indices, last_indices]
+        current_query_ids = [
+            int(input_ids[idx, 0, int(last_indices[idx].item())].item())
+            for idx in range(batch_size)
+        ]
+        pointer_scale = self.timestamp_query_proj.out_features**-0.5
+
+        for step in range(max_new_tokens):
+            next_id = self._sample_next_text_ids(logits, temperature)
+            next_id = torch.where(
+                finished.unsqueeze(1),
+                torch.full_like(next_id, eos_id),
+                next_id,
+            )
+            next_ids = next_id.squeeze(1)
+            newly_finished = next_ids == eos_id
+
+            for idx, token_id in enumerate(next_ids.tolist()):
+                if bool(finished[idx].item()):
+                    continue
+
+                if token_id != eos_id or include_eos:
+                    query = self.timestamp_query_proj(
+                        current_query_states[idx : idx + 1]
+                    )
+                    pointer_logits = (
+                        torch.matmul(query, audio_keys[idx].transpose(0, 1))
+                        * pointer_scale
+                    )
+                    pointer_probs = torch.softmax(pointer_logits.float(), dim=-1)[0]
+                    pointer_rows[idx].append(pointer_probs.detach().cpu())
+
+                    token_ids[idx].append(token_id)
+                    token_texts[idx].append(
+                        tokenizer.decode([token_id], skip_special_tokens=False)
+                    )
+                    query_id = current_query_ids[idx]
+                    query_token_ids[idx].append(query_id)
+                    query_token_texts[idx].append(
+                        tokenizer.decode([query_id], skip_special_tokens=False)
+                    )
+
+                if token_id != eos_id:
+                    generated[idx].append(token_id)
+
+            finished = finished | newly_finished
+            if finished.all():
+                break
+
+            next_col = next_id.view(batch_size, 1, 1).expand(-1, c, -1)
+            next_audio_mask = audio_mask.new_zeros(batch_size, 1)
+            next_inputs_embeds = self._prepare_embed_inputs(
+                next_col,
+                next_audio_mask,
+            )
+            generated_mask = torch.ones(
+                batch_size,
+                step + 1,
+                dtype=torch.bool,
+                device=device,
+            )
+            decode_attention_mask = torch.cat(
+                [prompt_valid_mask, generated_mask],
+                dim=1,
+            )
+            next_position_ids = (lengths_tensor + step).unsqueeze(1)
+
+            decode_outputs = self.llm(
+                inputs_embeds=next_inputs_embeds,
+                attention_mask=decode_attention_mask,
+                return_dict=True,
+                position_ids=next_position_ids,
+                past_key_values=past_key_values,
+                use_cache=True,
+            )
+            past_key_values = decode_outputs.past_key_values
+            current_query_states = decode_outputs[0][:, -1, :]
+            current_query_ids = [int(token_id) for token_id in next_ids.tolist()]
+            logits = self.text_head(decode_outputs[0])[:, -1, :]
+
+        traces = []
+        for idx in range(batch_size):
+            if pointer_rows[idx]:
+                audio_attention = torch.stack(pointer_rows[idx], dim=0)
+            else:
+                audio_attention = torch.empty(
+                    0,
+                    audio_lengths_out[idx],
+                    dtype=torch.float32,
+                )
+
+            traces.append(
+                {
+                    "text": tokenizer.decode(
+                        generated[idx],
+                        skip_special_tokens=True,
+                    ).strip(),
+                    "token_ids": token_ids[idx],
+                    "token_texts": token_texts[idx],
+                    "query_token_ids": query_token_ids[idx],
+                    "query_token_texts": query_token_texts[idx],
+                    "audio_attention": audio_attention,
+                    "audio_start": audio_starts[idx],
+                    "audio_end": audio_ends[idx],
+                    "audio_num_tokens": audio_lengths_out[idx],
+                    "timestamp_source": "pointer",
                 }
             )
         return traces
