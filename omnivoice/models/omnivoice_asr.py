@@ -28,6 +28,7 @@ class OmniVoiceASROutput(ModelOutput):
     text_loss: Optional[torch.Tensor] = None
     timestamp_loss: Optional[torch.Tensor] = None
     logits: Optional[torch.Tensor] = None
+    hidden_states: Optional[torch.Tensor] = None
     past_key_values: Optional[object] = None
     attentions: Optional[object] = None
 
@@ -397,6 +398,7 @@ class OmniVoiceForSpeechRecognition(PreTrainedModel):
         use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
         timestamp_center_labels: Optional[torch.LongTensor] = None,
+        return_hidden_states: bool = False,
     ):
         inputs_embeds = self._prepare_embed_inputs(input_ids, audio_mask)
 
@@ -457,6 +459,7 @@ class OmniVoiceForSpeechRecognition(PreTrainedModel):
             text_loss=text_loss,
             timestamp_loss=timestamp_loss,
             logits=logits,
+            hidden_states=hidden_states if return_hidden_states else None,
             past_key_values=getattr(llm_outputs, "past_key_values", None),
             attentions=getattr(llm_outputs, "attentions", None),
         )
