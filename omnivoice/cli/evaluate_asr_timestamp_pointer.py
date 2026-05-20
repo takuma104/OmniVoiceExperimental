@@ -13,7 +13,11 @@ from accelerate.utils import set_seed
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer
 
-from omnivoice.cli.timestamp_asr import _audio_duration_seconds, _centers_to_spans
+from omnivoice.cli.timestamp_asr import (
+    _audio_duration_seconds,
+    _centers_to_spans,
+    _viterbi_monotonic_centers,
+)
 from omnivoice.cli.transcribe_asr import (
     _get_best_device,
     _iter_batch_chunks,
@@ -89,7 +93,8 @@ def _to_device(batch: dict[str, torch.Tensor], device: str) -> dict[str, torch.T
 def _predict_batch_centers(
     model: OmniVoiceForSpeechRecognition,
     batch: dict[str, torch.Tensor],
-) -> tuple[torch.Tensor, torch.Tensor]:
+    args: argparse.Namespace,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     outputs = model(**batch, return_hidden_states=True)
     hidden_states = outputs.hidden_states
     if hidden_states is None:
@@ -98,6 +103,12 @@ def _predict_batch_centers(
     labels = batch["timestamp_center_labels"]
     predictions = torch.full_like(labels, -100)
     confidences = torch.zeros(labels.shape, dtype=torch.float32, device=labels.device)
+    monotonic_predictions = torch.full_like(labels, -100)
+    monotonic_confidences = torch.zeros(
+        labels.shape,
+        dtype=torch.float32,
+        device=labels.device,
+    )
     scale = model.timestamp_query_proj.out_features**-0.5
 
     for batch_idx in range(hidden_states.size(0)):
@@ -121,7 +132,28 @@ def _predict_batch_centers(
         predictions[batch_idx, query_positions] = pred.to(predictions.dtype)
         confidences[batch_idx, query_positions] = confidence
 
-    return predictions.detach().cpu(), confidences.detach().cpu()
+        monotonic_centers = _viterbi_monotonic_centers(
+            attention=probs.detach().cpu().numpy(),
+            max_step_ratio=args.monotonic_max_step_ratio,
+            transition_penalty=args.monotonic_transition_penalty,
+        )
+        monotonic_centers_tensor = torch.tensor(
+            monotonic_centers,
+            dtype=monotonic_predictions.dtype,
+            device=monotonic_predictions.device,
+        )
+        monotonic_predictions[batch_idx, query_positions] = monotonic_centers_tensor
+        monotonic_confidences[batch_idx, query_positions] = probs[
+            torch.arange(len(monotonic_centers), device=probs.device),
+            monotonic_centers_tensor.to(probs.device),
+        ]
+
+    return (
+        predictions.detach().cpu(),
+        confidences.detach().cpu(),
+        monotonic_predictions.detach().cpu(),
+        monotonic_confidences.detach().cpu(),
+    )
 
 
 def _build_output_item(
@@ -130,8 +162,10 @@ def _build_output_item(
     tokenizer: AutoTokenizer,
     pred_labels: torch.Tensor,
     confidence_labels: torch.Tensor,
+    monotonic_pred_labels: torch.Tensor,
+    monotonic_confidence_labels: torch.Tensor,
     args: argparse.Namespace,
-) -> tuple[dict, list[int]]:
+) -> tuple[dict, list[int], list[int]]:
     label = sample["label"]
     gold_labels = processed["timestamp_center_labels"]
     query_positions = torch.nonzero(gold_labels >= 0, as_tuple=False).squeeze(1)
@@ -144,15 +178,21 @@ def _build_output_item(
     )
 
     predicted_centers = []
+    monotonic_centers = []
     token_items = []
     errors = []
+    monotonic_errors = []
     for token_index, query_pos in enumerate(query_positions.tolist()):
         pred_center = int(pred_labels[query_pos].item())
+        monotonic_center = int(monotonic_pred_labels[query_pos].item())
         gold_center = int(gold_labels[query_pos].item())
         token_id = int(processed["input_ids"][0, query_pos + 1].item())
         predicted_centers.append(pred_center)
+        monotonic_centers.append(monotonic_center)
         abs_error = abs(pred_center - gold_center)
+        monotonic_abs_error = abs(monotonic_center - gold_center)
         errors.append(abs_error)
+        monotonic_errors.append(monotonic_abs_error)
         token_items.append(
             {
                 "index": token_index,
@@ -168,6 +208,14 @@ def _build_output_item(
                     (gold_center + 0.5) * audio_seconds / audio_num_tokens
                 ),
                 "pointer_confidence": float(confidence_labels[query_pos].item()),
+                "monotonic_center_audio_token": monotonic_center,
+                "monotonic_center_error_audio_tokens": monotonic_abs_error,
+                "monotonic_center_sec": float(
+                    (monotonic_center + 0.5) * audio_seconds / audio_num_tokens
+                ),
+                "monotonic_pointer_confidence": float(
+                    monotonic_confidence_labels[query_pos].item()
+                ),
             }
         )
 
@@ -182,6 +230,19 @@ def _build_output_item(
         token_item["start_sec"] = float(start * audio_seconds / audio_num_tokens)
         token_item["end_sec"] = float(end * audio_seconds / audio_num_tokens)
 
+    monotonic_spans = _centers_to_spans(
+        centers=monotonic_centers,
+        num_audio_tokens=audio_num_tokens,
+        min_span_tokens=args.min_span_tokens,
+    )
+    for token_item, (start, end) in zip(token_items, monotonic_spans):
+        token_item["monotonic_start_audio_token"] = int(start)
+        token_item["monotonic_end_audio_token"] = int(end)
+        token_item["monotonic_start_sec"] = float(
+            start * audio_seconds / audio_num_tokens
+        )
+        token_item["monotonic_end_sec"] = float(end * audio_seconds / audio_num_tokens)
+
     output_item = {
         "id": label.get("id"),
         "language_id": label.get("language_id"),
@@ -194,10 +255,48 @@ def _build_output_item(
     }
     if args.include_reference:
         output_item["reference"] = label.get("text")
-    return output_item, errors
+    return output_item, errors, monotonic_errors
 
 
-def _summarize(errors: list[int], second_errors: list[float], violations: int, pairs: int):
+def _error_buckets(errors: list[int]) -> dict[str, dict[str, float | int]]:
+    buckets = {
+        "0": 0,
+        "1": 0,
+        "2_5": 0,
+        "6_10": 0,
+        "11_25": 0,
+        "26_plus": 0,
+    }
+    for error in errors:
+        if error == 0:
+            buckets["0"] += 1
+        elif error == 1:
+            buckets["1"] += 1
+        elif error <= 5:
+            buckets["2_5"] += 1
+        elif error <= 10:
+            buckets["6_10"] += 1
+        elif error <= 25:
+            buckets["11_25"] += 1
+        else:
+            buckets["26_plus"] += 1
+
+    total = len(errors)
+    return {
+        name: {
+            "count": count,
+            "rate": float(count / total) if total else None,
+        }
+        for name, count in buckets.items()
+    }
+
+
+def _summarize(
+    errors: list[int],
+    second_errors: list[float],
+    violations: int,
+    pairs: int,
+):
     if not errors:
         return {
             "num_tokens": 0,
@@ -210,6 +309,7 @@ def _summarize(errors: list[int], second_errors: list[float], violations: int, p
             "within_10_tokens": None,
             "center_mae_seconds": None,
             "monotonic_violation_rate": None,
+            "error_buckets": _error_buckets(errors),
         }
 
     n = len(errors)
@@ -226,6 +326,53 @@ def _summarize(errors: list[int], second_errors: list[float], violations: int, p
         if second_errors
         else None,
         "monotonic_violation_rate": float(violations / pairs) if pairs else None,
+        "error_buckets": _error_buckets(errors),
+    }
+
+
+def _sample_error_summary(
+    output_item: dict,
+    errors: list[int],
+    monotonic_errors: list[int],
+    worst_token_count: int,
+) -> dict:
+    tokens = output_item["tokens"]
+    ranked_tokens = sorted(
+        tokens,
+        key=lambda token: token["center_error_audio_tokens"],
+        reverse=True,
+    )
+    ranked_monotonic_tokens = sorted(
+        tokens,
+        key=lambda token: token["monotonic_center_error_audio_tokens"],
+        reverse=True,
+    )
+    return {
+        "id": output_item.get("id"),
+        "text": output_item.get("text"),
+        "audio_num_tokens": output_item.get("audio_num_tokens"),
+        "audio_seconds": output_item.get("audio_seconds"),
+        "num_tokens": len(tokens),
+        "max_error_tokens": max(errors) if errors else None,
+        "mean_error_tokens": float(sum(errors) / len(errors)) if errors else None,
+        "within_10_token": float(sum(e <= 10 for e in errors) / len(errors))
+        if errors
+        else None,
+        "monotonic_max_error_tokens": max(monotonic_errors)
+        if monotonic_errors
+        else None,
+        "monotonic_mean_error_tokens": float(
+            sum(monotonic_errors) / len(monotonic_errors)
+        )
+        if monotonic_errors
+        else None,
+        "monotonic_within_10_token": float(
+            sum(e <= 10 for e in monotonic_errors) / len(monotonic_errors)
+        )
+        if monotonic_errors
+        else None,
+        "worst_tokens": ranked_tokens[:worst_token_count],
+        "monotonic_worst_tokens": ranked_monotonic_tokens[:worst_token_count],
     }
 
 
@@ -242,6 +389,14 @@ def evaluate_timestamp_pointer(args):
         raise ValueError("--bucket_size must be >= 0")
     if args.limit is not None and args.limit < 0:
         raise ValueError("--limit must be >= 0")
+    if args.worst_top_k < 0:
+        raise ValueError("--worst_top_k must be >= 0")
+    if args.worst_token_count < 0:
+        raise ValueError("--worst_token_count must be >= 0")
+    if args.monotonic_max_step_ratio < 0:
+        raise ValueError("--monotonic_max_step_ratio must be >= 0")
+    if args.monotonic_transition_penalty < 0:
+        raise ValueError("--monotonic_transition_penalty must be >= 0")
 
     use_bucketing = args.bucket_size > args.batch_size
     window_size = args.bucket_size if use_bucketing else args.batch_size
@@ -282,8 +437,13 @@ def evaluate_timestamp_pointer(args):
 
     all_errors: list[int] = []
     all_second_errors: list[float] = []
+    all_monotonic_errors: list[int] = []
+    all_monotonic_second_errors: list[float] = []
     monotonic_violations = 0
     monotonic_pairs = 0
+    constrained_violations = 0
+    constrained_pairs = 0
+    worst_samples = []
     processed_samples = 0
     skipped_samples = 0
     progress = tqdm(total=args.limit, disable=args.no_progress, unit="sample")
@@ -332,37 +492,71 @@ def evaluate_timestamp_pointer(args):
                     pad_token_id=tokenizer.pad_token_id,
                     num_channels=model.config.num_audio_codebook,
                 )
-                predictions, confidences = _predict_batch_centers(
+                (
+                    predictions,
+                    confidences,
+                    monotonic_predictions,
+                    monotonic_confidences,
+                ) = _predict_batch_centers(
                     model,
                     _to_device(batch, device),
+                    args,
                 )
 
                 for row_idx, (item, sample, processed_sample) in enumerate(
                     zip(valid_items, raw_samples, processed)
                 ):
-                    output_item, errors = _build_output_item(
+                    output_item, errors, monotonic_errors = _build_output_item(
                         sample=sample,
                         processed=processed_sample,
                         tokenizer=tokenizer,
                         pred_labels=predictions[row_idx],
                         confidence_labels=confidences[row_idx],
+                        monotonic_pred_labels=monotonic_predictions[row_idx],
+                        monotonic_confidence_labels=monotonic_confidences[row_idx],
                         args=args,
                     )
                     centers = [
                         token["center_audio_token"] for token in output_item["tokens"]
+                    ]
+                    constrained_centers = [
+                        token["monotonic_center_audio_token"]
+                        for token in output_item["tokens"]
                     ]
                     monotonic_violations += sum(
                         next_center < center
                         for center, next_center in zip(centers[:-1], centers[1:])
                     )
                     monotonic_pairs += max(0, len(centers) - 1)
+                    constrained_violations += sum(
+                        next_center < center
+                        for center, next_center in zip(
+                            constrained_centers[:-1],
+                            constrained_centers[1:],
+                        )
+                    )
+                    constrained_pairs += max(0, len(constrained_centers) - 1)
                     audio_seconds = float(output_item["audio_seconds"])
                     audio_num_tokens = int(output_item["audio_num_tokens"])
                     all_errors.extend(errors)
+                    all_monotonic_errors.extend(monotonic_errors)
                     all_second_errors.extend(
                         error * audio_seconds / audio_num_tokens for error in errors
                     )
+                    all_monotonic_second_errors.extend(
+                        error * audio_seconds / audio_num_tokens
+                        for error in monotonic_errors
+                    )
                     window_outputs[item["order"]] = (output_item, errors)
+                    if args.worst_jsonl is not None:
+                        worst_samples.append(
+                            _sample_error_summary(
+                                output_item=output_item,
+                                errors=errors,
+                                monotonic_errors=monotonic_errors,
+                                worst_token_count=args.worst_token_count,
+                            )
+                        )
                     processed_samples += 1
 
                 progress.update(len(batch_items))
@@ -392,8 +586,28 @@ def evaluate_timestamp_pointer(args):
         monotonic_violations,
         monotonic_pairs,
     )
+    summary["monotonic"] = _summarize(
+        all_monotonic_errors,
+        all_monotonic_second_errors,
+        constrained_violations,
+        constrained_pairs,
+    )
     summary["num_samples"] = processed_samples
     summary["skipped_samples"] = skipped_samples
+
+    if args.worst_jsonl is not None:
+        worst_path = Path(args.worst_jsonl)
+        worst_path.parent.mkdir(parents=True, exist_ok=True)
+        worst_samples.sort(
+            key=lambda item: (
+                item["max_error_tokens"] or -1,
+                item["mean_error_tokens"] or -1.0,
+            ),
+            reverse=True,
+        )
+        with worst_path.open("w", encoding="utf-8") as f:
+            for item in worst_samples[: args.worst_top_k]:
+                print(json.dumps(item, ensure_ascii=False), file=f)
 
     if args.summary_json is not None:
         summary_path = Path(args.summary_json)
@@ -422,6 +636,23 @@ def main():
     )
     parser.add_argument("--output_jsonl", default=None)
     parser.add_argument("--summary_json", default=None)
+    parser.add_argument(
+        "--worst_jsonl",
+        default=None,
+        help="Optional JSONL path for the worst samples by max argmax error.",
+    )
+    parser.add_argument(
+        "--worst_top_k",
+        type=int,
+        default=100,
+        help="Number of worst samples to write when --worst_jsonl is set.",
+    )
+    parser.add_argument(
+        "--worst_token_count",
+        type=int,
+        default=8,
+        help="Number of worst tokens included per sample in --worst_jsonl.",
+    )
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument(
@@ -432,6 +663,18 @@ def main():
     )
     parser.add_argument("--timestamp_min_confidence", type=float, default=0.0)
     parser.add_argument("--min_span_tokens", type=int, default=0)
+    parser.add_argument(
+        "--monotonic_max_step_ratio",
+        type=float,
+        default=8.0,
+        help="Max token-to-token audio jump for monotonic Viterbi. 0 disables.",
+    )
+    parser.add_argument(
+        "--monotonic_transition_penalty",
+        type=float,
+        default=0.03,
+        help="Penalty for deviating from average monotonic step.",
+    )
     parser.add_argument("--audio_duration", type=float, default=None)
     parser.add_argument("--audio_frame_rate", type=float, default=25.0)
     parser.add_argument("--device", default="auto")
