@@ -72,6 +72,13 @@ class TrainingConfig:
     asr_timestamp_loss_weight: float = 1.0
     asr_timestamp_head_dim: int = 256
     asr_timestamp_min_confidence: float = 0.0
+    asr_plain_ratio: float = 1.0
+    asr_furigana_audio_ratio: float = 0.0
+    asr_furigana_rewrite_ratio: float = 0.0
+    asr_eval_task_mode: str = "plain"
+    asr_text_field: str = "text"
+    asr_furigana_text_field: str = "text_fugashi"
+    asr_source_text_field: str = "text"
 
     # Training Hyperparams
     learning_rate: float = 1e-4

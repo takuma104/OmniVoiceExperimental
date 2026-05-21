@@ -32,6 +32,16 @@ from typing import Any, Dict
 
 import torch
 
+ASR_TASK_PLAIN = "plain"
+ASR_TASK_FURIGANA_AUDIO = "furigana_audio"
+ASR_TASK_FURIGANA_REWRITE = "furigana_rewrite"
+ASR_TASK_SAMPLE = "sample"
+ASR_TASK_MODES = {
+    ASR_TASK_PLAIN,
+    ASR_TASK_FURIGANA_AUDIO,
+    ASR_TASK_FURIGANA_REWRITE,
+}
+
 
 class OmniVoiceSampleProcessor:
     """
@@ -262,7 +272,15 @@ class OmniVoiceSimpleSampleProcessor:
 
 
 class OmniVoiceASRSampleProcessor:
-    """Prepare OmniVoice codec tokens for autoregressive ASR training."""
+    """Prepare OmniVoice codec tokens for autoregressive ASR training.
+
+    Supported task layouts:
+
+    - ``plain``: ``<|asr|> audio -> text``
+    - ``furigana_audio``: ``<|asr_furigana|> audio -> text_fugashi``
+    - ``furigana_rewrite``:
+      ``<|furigana_rewrite|> audio + source text -> text_fugashi``
+    """
 
     def __init__(
         self,
@@ -271,18 +289,85 @@ class OmniVoiceASRSampleProcessor:
         language_ratio: float = 1.0,
         timestamp_enabled: bool = False,
         timestamp_min_confidence: float = 0.0,
+        task_mode: str = ASR_TASK_SAMPLE,
+        plain_ratio: float = 1.0,
+        furigana_audio_ratio: float = 0.0,
+        furigana_rewrite_ratio: float = 0.0,
+        text_field: str = "text",
+        furigana_text_field: str = "text_fugashi",
+        source_text_field: str = "text",
     ):
         self.text_tokenizer = text_tokenizer
         self.num_channels = num_channels
         self.language_ratio = language_ratio
         self.timestamp_enabled = timestamp_enabled
         self.timestamp_min_confidence = timestamp_min_confidence
+        self.task_mode = task_mode
+        self.plain_ratio = plain_ratio
+        self.furigana_audio_ratio = furigana_audio_ratio
+        self.furigana_rewrite_ratio = furigana_rewrite_ratio
+        self.text_field = text_field
+        self.furigana_text_field = furigana_text_field
+        self.source_text_field = source_text_field
+
+        if self.task_mode != ASR_TASK_SAMPLE and self.task_mode not in ASR_TASK_MODES:
+            raise ValueError(
+                f"Unsupported ASR task mode: {self.task_mode!r}. "
+                f"Expected one of {sorted(ASR_TASK_MODES | {ASR_TASK_SAMPLE})}."
+            )
+        self._task_weights = [
+            (ASR_TASK_PLAIN, float(self.plain_ratio)),
+            (ASR_TASK_FURIGANA_AUDIO, float(self.furigana_audio_ratio)),
+            (ASR_TASK_FURIGANA_REWRITE, float(self.furigana_rewrite_ratio)),
+        ]
+        if self.task_mode == ASR_TASK_SAMPLE and not any(
+            weight > 0 for _, weight in self._task_weights
+        ):
+            raise ValueError(
+                "At least one ASR task ratio must be > 0 when task_mode='sample'."
+            )
+
+    def _choose_task_mode(self) -> str:
+        if self.task_mode != ASR_TASK_SAMPLE:
+            return self.task_mode
+
+        total = sum(max(weight, 0.0) for _, weight in self._task_weights)
+        draw = random.uniform(0.0, total)
+        cumulative = 0.0
+        for mode, weight in self._task_weights:
+            if weight <= 0:
+                continue
+            cumulative += weight
+            if draw <= cumulative:
+                return mode
+        return ASR_TASK_PLAIN
+
+    @staticmethod
+    def _task_token(task_mode: str) -> str:
+        if task_mode == ASR_TASK_PLAIN:
+            return "<|asr|>"
+        if task_mode == ASR_TASK_FURIGANA_AUDIO:
+            return "<|asr_furigana|>"
+        if task_mode == ASR_TASK_FURIGANA_REWRITE:
+            return "<|furigana_rewrite|>"
+        raise ValueError(f"Unsupported ASR task mode: {task_mode!r}")
+
+    @staticmethod
+    def _require_text(label: Dict[str, Any], field: str, task_mode: str) -> str:
+        if field not in label:
+            sample_id = label.get("id", "?")
+            raise KeyError(
+                f"Sample {sample_id!r} is missing required field {field!r} "
+                f"for ASR task mode {task_mode!r}."
+            )
+        return str(label[field])
 
     def __call__(self, sample: Dict[str, Any]) -> Dict[str, Any]:
         label = sample["label"]
+        task_mode = self._choose_task_mode()
         use_language = random.uniform(0, 1) < self.language_ratio
 
-        style = "<|asr|>"
+        style = self._task_token(task_mode)
         if use_language:
             language = label.get("language_id", "None")
             style += f"<|lang_start|>{language}<|lang_end|>"
@@ -299,17 +384,30 @@ class OmniVoiceASRSampleProcessor:
                 f"got {audio_tokens.size(0)}"
             )
 
-        text = label["text"]
+        if task_mode == ASR_TASK_PLAIN:
+            text = self._require_text(label, self.text_field, task_mode)
+        else:
+            text = self._require_text(label, self.furigana_text_field, task_mode)
         text_ids = self.text_tokenizer(
             f"<|text_start|>{text}<|text_end|>", return_tensors="pt"
         ).input_ids
         text_inputs = text_ids.repeat(self.num_channels, 1)
 
-        input_ids = torch.cat([style_inputs, audio_tokens, text_inputs], dim=1)
+        sequence_parts = [style_inputs, audio_tokens]
+        if task_mode == ASR_TASK_FURIGANA_REWRITE:
+            source_text = self._require_text(label, self.source_text_field, task_mode)
+            source_ids = self.text_tokenizer(
+                f"<|src_text_start|>{source_text}<|src_text_end|>",
+                return_tensors="pt",
+            ).input_ids
+            sequence_parts.append(source_ids.repeat(self.num_channels, 1))
+
+        text_start_idx = sum(part.shape[1] for part in sequence_parts)
+        sequence_parts.append(text_inputs)
+        input_ids = torch.cat(sequence_parts, dim=1)
         total_length = input_ids.shape[1]
         audio_start_idx = style_inputs.shape[1]
         audio_end_idx = audio_start_idx + audio_tokens.shape[1]
-        text_start_idx = audio_end_idx
 
         audio_mask = torch.zeros(total_length, dtype=torch.bool)
         audio_mask[audio_start_idx:audio_end_idx] = True
@@ -328,10 +426,11 @@ class OmniVoiceASRSampleProcessor:
             "audio_mask": audio_mask,  # [L]
             "text_causal_mask": text_causal_mask,  # [L]
             "length": total_length,
+            "task_mode": task_mode,
         }
 
         timestamp = sample.get("timestamp")
-        if timestamp is not None:
+        if timestamp is not None and task_mode == ASR_TASK_PLAIN:
             return_dict["timestamp_center_labels"] = (
                 self._build_timestamp_center_labels(
                     timestamp=timestamp,

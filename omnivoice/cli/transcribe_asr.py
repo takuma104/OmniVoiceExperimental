@@ -190,11 +190,23 @@ def transcribe(args):
                     else label.get("language_id")
                     for label in labels
                 ]
+                source_texts = None
+                if args.task_mode == "furigana_rewrite":
+                    source_texts = []
+                    for label in labels:
+                        if args.source_text_field not in label:
+                            raise KeyError(
+                                f"Sample {label.get('id', '?')!r} is missing "
+                                f"source text field {args.source_text_field!r}."
+                            )
+                        source_texts.append(label[args.source_text_field])
 
                 texts = model.generate_text_batch(
                     audio_tokens=audio_tokens,
                     tokenizer=tokenizer,
                     languages=languages,
+                    task_mode=args.task_mode,
+                    source_texts=source_texts,
                     max_new_tokens=args.max_new_tokens,
                     temperature=args.temperature,
                     use_cache=not args.no_kv_cache,
@@ -224,10 +236,21 @@ def transcribe(args):
                 item = {
                     "id": label.get("id"),
                     "language_id": language,
+                    "task_mode": args.task_mode,
                     "text": text,
                 }
                 if args.include_reference:
-                    item["reference"] = label.get("text")
+                    reference_field = args.reference_field
+                    if reference_field is None:
+                        reference_field = (
+                            "text"
+                            if args.task_mode == "plain"
+                            else args.furigana_text_field
+                        )
+                    item["reference"] = label.get(reference_field)
+                    item["reference_field"] = reference_field
+                if args.task_mode == "furigana_rewrite":
+                    item["source_text"] = label.get(args.source_text_field)
                 if output_file is not None:
                     print(json.dumps(item, ensure_ascii=False), file=output_file, flush=True)
                 else:
@@ -278,6 +301,27 @@ def main():
         help="Override language id. Defaults to label['language_id'].",
     )
     parser.add_argument(
+        "--task_mode",
+        default="plain",
+        choices=["plain", "furigana_audio", "furigana_rewrite"],
+        help="ASR generation task.",
+    )
+    parser.add_argument(
+        "--source_text_field",
+        default="text",
+        help="Label field used as prefilled source transcript for furigana_rewrite.",
+    )
+    parser.add_argument(
+        "--furigana_text_field",
+        default="text_fugashi",
+        help="Default reference field for furigana task outputs.",
+    )
+    parser.add_argument(
+        "--reference_field",
+        default=None,
+        help="Explicit label field to emit when --include_reference is set.",
+    )
+    parser.add_argument(
         "--plain",
         action="store_true",
         help="Print only transcript text, one line per sample.",
@@ -285,7 +329,7 @@ def main():
     parser.add_argument(
         "--include_reference",
         action="store_true",
-        help="Include label['text'] in JSONL output for quick inspection.",
+        help="Include a reference label field in JSONL output for quick inspection.",
     )
     parser.add_argument(
         "--no_kv_cache",

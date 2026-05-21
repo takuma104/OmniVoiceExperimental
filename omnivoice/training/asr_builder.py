@@ -115,6 +115,8 @@ def _load_timestamps_from_data_config(
 def _add_asr_special_tokens(tokenizer):
     new_tokens = [
         "<|asr|>",
+        "<|asr_furigana|>",
+        "<|furigana_rewrite|>",
         "<|denoise|>",
         "<|lang_start|>",
         "<|lang_end|>",
@@ -122,6 +124,8 @@ def _add_asr_special_tokens(tokenizer):
         "<|instruct_end|>",
         "<|text_start|>",
         "<|text_end|>",
+        "<|src_text_start|>",
+        "<|src_text_end|>",
         "<|src_lang_start|>",
         "<|src_lang_end|>",
         "<|tgt_lang_start|>",
@@ -256,6 +260,13 @@ def build_asr_dataloaders(
         language_ratio=config.language_ratio,
         timestamp_enabled=config.asr_enable_timestamp_head,
         timestamp_min_confidence=config.asr_timestamp_min_confidence,
+        task_mode="sample",
+        plain_ratio=config.asr_plain_ratio,
+        furigana_audio_ratio=config.asr_furigana_audio_ratio,
+        furigana_rewrite_ratio=config.asr_furigana_rewrite_ratio,
+        text_field=config.asr_text_field,
+        furigana_text_field=config.asr_furigana_text_field,
+        source_text_field=config.asr_source_text_field,
     )
 
     train_manifests, dev_manifests = prepare_data_manifests_from_json(
@@ -292,17 +303,36 @@ def build_asr_dataloaders(
 
     eval_loader = None
     if dev_manifests:
+        eval_processor = OmniVoiceASRSampleProcessor(
+            text_tokenizer=tokenizer,
+            num_channels=config.num_audio_codebook,
+            language_ratio=config.language_ratio,
+            timestamp_enabled=config.asr_enable_timestamp_head,
+            timestamp_min_confidence=config.asr_timestamp_min_confidence,
+            task_mode=config.asr_eval_task_mode,
+            plain_ratio=config.asr_plain_ratio,
+            furigana_audio_ratio=config.asr_furigana_audio_ratio,
+            furigana_rewrite_ratio=config.asr_furigana_rewrite_ratio,
+            text_field=config.asr_text_field,
+            furigana_text_field=config.asr_furigana_text_field,
+            source_text_field=config.asr_source_text_field,
+        )
+        eval_collate_fn = ASRPackingDataCollator(eval_processor, config.batch_tokens)
         raw_dev_ds = WebDatasetReader(manifests=dev_manifests, evaluation=True)
         if config.asr_enable_timestamp_head:
             dev_timestamps = _load_timestamps_from_data_config(config.data_config, "dev")
             if dev_timestamps:
                 raw_dev_ds = TimestampWrappedReader(raw_dev_ds, dev_timestamps)
-        dev_dataset = PackingIterableDataset(raw_dev_ds, processor, config.batch_tokens)
+        dev_dataset = PackingIterableDataset(
+            raw_dev_ds,
+            eval_processor,
+            config.batch_tokens,
+        )
         eval_loader = DataLoader(
             dev_dataset,
             batch_size=None,
             num_workers=1,
-            collate_fn=collate_fn,
+            collate_fn=eval_collate_fn,
             pin_memory=True,
             prefetch_factor=2,
         )

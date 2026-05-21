@@ -158,14 +158,34 @@ def evaluate(args):
         progress = tqdm(_iter_samples(args.data_lst), total=args.limit)
         for sample in progress:
             label = sample["label"]
-            ref_text = label["text"]
+            reference_field = args.reference_field
+            if reference_field is None:
+                reference_field = (
+                    "text" if args.task_mode == "plain" else args.furigana_text_field
+                )
+            if reference_field not in label:
+                raise KeyError(
+                    f"Sample {label.get('id', '?')!r} is missing reference field "
+                    f"{reference_field!r}."
+                )
+            ref_text = label[reference_field]
             language = args.language or label.get("language_id")
             audio_tokens = sample["audio_tokens"]
+            source_text = None
+            if args.task_mode == "furigana_rewrite":
+                if args.source_text_field not in label:
+                    raise KeyError(
+                        f"Sample {label.get('id', '?')!r} is missing source text "
+                        f"field {args.source_text_field!r}."
+                    )
+                source_text = label[args.source_text_field]
 
             hyp_text = model.generate_text(
                 audio_tokens=audio_tokens,
                 tokenizer=tokenizer,
                 language=language,
+                task_mode=args.task_mode,
+                source_text=source_text,
                 max_new_tokens=args.max_new_tokens,
                 temperature=args.temperature,
             )
@@ -196,7 +216,9 @@ def evaluate(args):
             item = {
                 "id": label.get("id"),
                 "language_id": language,
+                "task_mode": args.task_mode,
                 "reference": ref_text,
+                "reference_field": reference_field,
                 "hypothesis": hyp_text,
                 "reference_normalized": ref_norm,
                 "hypothesis_normalized": hyp_norm,
@@ -231,6 +253,7 @@ def evaluate(args):
     summary = {
         "checkpoint": args.checkpoint,
         "data_lst": args.data_lst,
+        "task_mode": args.task_mode,
         "num_samples": count,
         "cer": _safe_rate(total_char_errors, total_chars),
         "wer": _safe_rate(total_word_errors, total_words),
@@ -289,6 +312,27 @@ def main():
         "--language",
         default=None,
         help="Override language id. Defaults to label['language_id'].",
+    )
+    parser.add_argument(
+        "--task_mode",
+        default="plain",
+        choices=["plain", "furigana_audio", "furigana_rewrite"],
+        help="ASR generation task.",
+    )
+    parser.add_argument(
+        "--source_text_field",
+        default="text",
+        help="Label field used as prefilled source transcript for furigana_rewrite.",
+    )
+    parser.add_argument(
+        "--furigana_text_field",
+        default="text_fugashi",
+        help="Default reference field for furigana task outputs.",
+    )
+    parser.add_argument(
+        "--reference_field",
+        default=None,
+        help="Explicit label field to use as evaluation reference.",
     )
     parser.add_argument("--no_normalize", action="store_true")
     parser.add_argument(

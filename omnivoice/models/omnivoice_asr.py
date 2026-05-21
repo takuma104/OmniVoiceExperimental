@@ -1389,6 +1389,8 @@ class OmniVoiceForSpeechRecognition(PreTrainedModel):
         audio_tokens: torch.Tensor,
         tokenizer: AutoTokenizer,
         language: Optional[str] = None,
+        task_mode: str = "plain",
+        source_text: Optional[str] = None,
         max_new_tokens: int = 256,
         temperature: float = 0.0,
         use_cache: bool = True,
@@ -1403,6 +1405,8 @@ class OmniVoiceForSpeechRecognition(PreTrainedModel):
             audio_tokens=audio_tokens,
             tokenizer=tokenizer,
             languages=[language],
+            task_mode=task_mode,
+            source_texts=[source_text],
             max_new_tokens=max_new_tokens,
             temperature=temperature,
             use_cache=use_cache,
@@ -1414,6 +1418,8 @@ class OmniVoiceForSpeechRecognition(PreTrainedModel):
         audio_tokens: Union[torch.Tensor, Sequence[torch.Tensor]],
         tokenizer: AutoTokenizer,
         languages: Optional[Sequence[Optional[str]]] = None,
+        task_mode: str = "plain",
+        source_texts: Optional[Sequence[Optional[str]]] = None,
         audio_lengths: Optional[Union[torch.Tensor, Sequence[int]]] = None,
         max_new_tokens: int = 256,
         temperature: float = 0.0,
@@ -1434,6 +1440,7 @@ class OmniVoiceForSpeechRecognition(PreTrainedModel):
         """
         device = next(self.parameters()).device
         c = self.config.num_audio_codebook
+        task_mode = self._normalize_generation_task_mode(task_mode)
 
         samples = self._normalize_generate_audio_batch(
             audio_tokens=audio_tokens,
@@ -1453,6 +1460,22 @@ class OmniVoiceForSpeechRecognition(PreTrainedModel):
                 f"Expected {batch_size} language entries, got {len(languages)}."
             )
 
+        if source_texts is None:
+            source_texts = [None] * batch_size
+        elif isinstance(source_texts, str):
+            source_texts = [source_texts] * batch_size
+        elif len(source_texts) != batch_size:
+            raise ValueError(
+                f"Expected {batch_size} source_text entries, got {len(source_texts)}."
+            )
+
+        if task_mode == "furigana_rewrite" and any(
+            source_text is None for source_text in source_texts
+        ):
+            raise ValueError(
+                "task_mode='furigana_rewrite' requires source_texts for every sample."
+            )
+
         text_start_ids = tokenizer("<|text_start|>", return_tensors="pt").input_ids.to(
             device
         )
@@ -1463,16 +1486,26 @@ class OmniVoiceForSpeechRecognition(PreTrainedModel):
         sample_audio_masks = []
         sample_text_causal_masks = []
         lengths = []
-        for sample, language in zip(samples, languages):
+        task_token = self._generation_task_token(task_mode)
+        for sample, language, source_text in zip(samples, languages, source_texts):
             sample = sample.to(device=device, dtype=torch.long)
-            style = "<|asr|>"
+            style = task_token
             if language is not None:
                 style += f"<|lang_start|>{language}<|lang_end|>"
             style_ids = tokenizer(style, return_tensors="pt").input_ids.to(device)
 
             style_inputs = style_ids.repeat(c, 1)
             text_inputs = text_start_ids.repeat(c, 1)
-            sample_input_ids = torch.cat([style_inputs, sample, text_inputs], dim=1)
+            sequence_parts = [style_inputs, sample]
+            if task_mode == "furigana_rewrite":
+                source_ids = tokenizer(
+                    f"<|src_text_start|>{source_text}<|src_text_end|>",
+                    return_tensors="pt",
+                ).input_ids.to(device)
+                sequence_parts.append(source_ids.repeat(c, 1))
+
+            sequence_parts.append(text_inputs)
+            sample_input_ids = torch.cat(sequence_parts, dim=1)
 
             audio_mask = torch.zeros(
                 sample_input_ids.size(1), dtype=torch.bool, device=device
@@ -1746,6 +1779,36 @@ class OmniVoiceForSpeechRecognition(PreTrainedModel):
             logits = self.text_head(decode_outputs[0])[:, -1, :]
 
         return self._decode_generated_texts(generated, tokenizer)
+
+    @staticmethod
+    def _normalize_generation_task_mode(task_mode: str) -> str:
+        aliases = {
+            "asr": "plain",
+            "plain": "plain",
+            "asr_plain": "plain",
+            "furigana": "furigana_audio",
+            "furigana_audio": "furigana_audio",
+            "asr_furigana": "furigana_audio",
+            "rewrite": "furigana_rewrite",
+            "furigana_rewrite": "furigana_rewrite",
+        }
+        normalized = aliases.get(task_mode)
+        if normalized is None:
+            raise ValueError(
+                f"Unsupported ASR generation task_mode: {task_mode!r}. "
+                "Expected plain, furigana_audio, or furigana_rewrite."
+            )
+        return normalized
+
+    @staticmethod
+    def _generation_task_token(task_mode: str) -> str:
+        if task_mode == "plain":
+            return "<|asr|>"
+        if task_mode == "furigana_audio":
+            return "<|asr_furigana|>"
+        if task_mode == "furigana_rewrite":
+            return "<|furigana_rewrite|>"
+        raise ValueError(f"Unsupported ASR generation task_mode: {task_mode!r}")
 
     @staticmethod
     def _normalize_generate_audio_batch(

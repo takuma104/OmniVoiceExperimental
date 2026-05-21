@@ -5,7 +5,7 @@ The script keeps existing audio tar shards untouched. It reads an OmniVoice
 ``data.lst`` manifest, rewrites each companion JSONL into a new ``txts``
 directory, and writes a new manifest that points at the rewritten JSONL files.
 
-By default the original ``text`` field is preserved and ``text_furigana`` is
+By default the original ``text`` field is preserved and ``text_fugashi`` is
 added. Use ``--replace_text`` when a downstream reader should consume the
 furigana text through the existing ``text`` field.
 """
@@ -376,7 +376,7 @@ def main() -> None:
         help="Subdirectory under output_dir for rewritten JSONL shards.",
     )
     parser.add_argument("--text_field", default="text")
-    parser.add_argument("--furigana_field", default="text_furigana")
+    parser.add_argument("--furigana_field", default="text_fugashi")
     parser.add_argument(
         "--replace_text",
         action="store_true",
