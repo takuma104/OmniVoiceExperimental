@@ -70,7 +70,6 @@ import torchaudio
 import webdataset as wds
 from datasets import load_dataset
 from torch.utils.data import DataLoader, IterableDataset
-from torch.utils.data import get_worker_info
 from tqdm.auto import tqdm
 from transformers import AutoFeatureExtractor, HiggsAudioV2TokenizerModel
 
@@ -350,31 +349,17 @@ class HFDatasetAdapter(IterableDataset):
         hf_dataset,
         sample_rate: int = HIGGS_INPUT_SAMPLE_RATE,
         normalize_audio: bool = True,
-        num_machines: int = 1,
-        machine_index: int = 0,
     ):
         self.hf_dataset = hf_dataset
         self.sample_rate = sample_rate
         self.normalize_audio = normalize_audio
-        self.num_machines = num_machines
-        self.machine_index = machine_index
 
     def __iter__(self):
-        worker_info = get_worker_info()
-        worker_id = worker_info.id if worker_info is not None else 0
-        num_workers = worker_info.num_workers if worker_info is not None else 1
-        machine_local_idx = 0
-
-        for global_idx, sample in enumerate(self.hf_dataset):
-            if (
-                self.num_machines > 1
-                and global_idx % self.num_machines != self.machine_index
-            ):
-                continue
-            if num_workers > 1 and machine_local_idx % num_workers != worker_id:
-                machine_local_idx += 1
-                continue
-            machine_local_idx += 1
+        # Worker- and node-level sharding is handled by the HF dataset itself
+        # (DataLoader workers via auto-sharding of `_ex_iterable`, and nodes via
+        # `.shard(...)` applied before wrapping). Adding modulo skipping here
+        # would compound with HF's auto-sharding and drop most samples.
+        for sample in self.hf_dataset:
             converted = self._convert_sample(sample)
             if converted is not None:
                 yield converted
@@ -632,6 +617,14 @@ def main() -> None:
                     f"'{chosen_split}'."
                 )
             hf_dataset = hf_dataset[chosen_split]
+
+        # Multi-node sharding: do this on the HF dataset itself so we don't
+        # compound with HF's auto-sharding across DataLoader workers.
+        if args.num_machines > 1:
+            hf_dataset = hf_dataset.shard(
+                num_shards=args.num_machines,
+                index=args.machine_index,
+            )
         if args.shuffle:
             if args.streaming:
                 hf_dataset = hf_dataset.shuffle(
@@ -668,8 +661,6 @@ def main() -> None:
             hf_dataset,
             sample_rate=HIGGS_INPUT_SAMPLE_RATE,
             normalize_audio=True,
-            num_machines=args.num_machines,
-            machine_index=args.machine_index,
         )
         loader_workers = args.loader_workers
 
