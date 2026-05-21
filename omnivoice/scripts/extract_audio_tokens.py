@@ -527,8 +527,6 @@ def main() -> None:
     assert (
         sum(input_modes) == 1
     ), "Exactly one of --input_manifest, --input_jsonl, or --dataset_name must be provided."
-    if args.dataset_name:
-        assert args.split, "--split must be provided when using --dataset_name."
 
     if args.num_machines > 1:
         assert (
@@ -600,11 +598,12 @@ def main() -> None:
         )
         load_kwargs: dict[str, Any] = {
             "path": args.dataset_name,
-            "split": args.split,
             "streaming": args.streaming,
         }
+        if args.split:
+            load_kwargs["split"] = args.split
         if data_files is not None:
-            if isinstance(data_files, str):
+            if isinstance(data_files, str) and args.split:
                 load_kwargs["data_files"] = {args.split: data_files}
             else:
                 load_kwargs["data_files"] = data_files
@@ -614,6 +613,25 @@ def main() -> None:
             load_kwargs["token"] = args.hf_token
 
         hf_dataset = load_dataset(**load_kwargs)
+
+        # When --split is omitted, load_dataset returns a (Iterable)DatasetDict;
+        # collapse it to a single split so downstream iteration works.
+        chosen_split = args.split
+        if args.split is None and hasattr(hf_dataset, "keys"):
+            splits = list(hf_dataset.keys())
+            assert splits, "Loaded dataset has no splits."
+            chosen_split = splits[0]
+            if len(splits) > 1:
+                logging.warning(
+                    f"No --split specified; dataset has multiple splits "
+                    f"({splits}). Using '{chosen_split}'."
+                )
+            else:
+                logging.info(
+                    f"No --split specified; using only available split: "
+                    f"'{chosen_split}'."
+                )
+            hf_dataset = hf_dataset[chosen_split]
         if args.shuffle:
             if args.streaming:
                 hf_dataset = hf_dataset.shuffle(
@@ -629,8 +647,8 @@ def main() -> None:
         else:
             try:
                 info = hf_dataset.info
-                if info and info.splits and args.split in info.splits:
-                    total_samples = info.splits[args.split].num_examples
+                if info and info.splits and chosen_split in info.splits:
+                    total_samples = info.splits[chosen_split].num_examples
             except Exception:
                 pass
         if total_samples is not None and args.num_machines > 1:
