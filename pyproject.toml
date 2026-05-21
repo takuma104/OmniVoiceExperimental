@@ -50,6 +50,7 @@ dependencies = [
     "loguru>=0.7.3",
     "librosa>=0.11.0",
     "muon-optimizer",
+    "fugashi[unidic]>=1.5.2",
 ]
 
 [project.optional-dependencies]
@@ -72,6 +73,9 @@ omnivoice-asr-transcribe = "omnivoice.cli.transcribe_asr:main"
 omnivoice-asr-attention = "omnivoice.cli.visualize_asr_attention:main"
 omnivoice-asr-timestamps = "omnivoice.cli.timestamp_asr:main"
 omnivoice-asr-timestamps-visualize = "omnivoice.cli.visualize_asr_timestamps:main"
+omnivoice-asr-timestamp-pointer-eval = "omnivoice.cli.evaluate_asr_timestamp_pointer:main"
+omnivoice-asr-streaming-sim = "omnivoice.cli.streaming_asr_sim:main"
+omnivoice-add-furigana = "omnivoice.scripts.add_furigana_to_manifest:main"
 
 [project.urls]
 Homepage = "https://github.com/k2-fsa/OmniVoice"
