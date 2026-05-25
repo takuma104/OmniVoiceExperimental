@@ -59,6 +59,7 @@ import json
 import logging
 import multiprocessing as mp
 import os
+import re
 import warnings
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 from pathlib import Path
@@ -224,7 +225,53 @@ def build_parser() -> argparse.ArgumentParser:
         default=10_000,
         help="Buffer size for HuggingFace streaming shuffle (default: 10000).",
     )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume from existing data.lst: skip already-processed sample IDs "
+        "and continue appending new shards. Only supported for HF dataset input.",
+    )
     return parser
+
+
+def parse_resume_state(manifest_path: str) -> tuple[int, set[str]]:
+    """Parse data.lst and return (next_shard_idx, set of already-processed IDs).
+
+    The shard index is parsed from the tar filename (expects shard-NNNNNN.tar).
+    Processed IDs are loaded from every referenced per-shard JSONL file.
+    """
+    next_idx = 0
+    jsonl_paths: list[str] = []
+    shard_pattern = re.compile(r"shard-(\d+)")
+    with open(manifest_path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split(" ")
+            if len(parts) < 2:
+                continue
+            tar_path, jsonl_path = parts[0], parts[1]
+            m = shard_pattern.search(os.path.basename(tar_path))
+            if m:
+                next_idx = max(next_idx, int(m.group(1)) + 1)
+            jsonl_paths.append(jsonl_path)
+
+    processed_ids: set[str] = set()
+    for jp in tqdm(jsonl_paths, desc="Loading processed IDs"):
+        if not os.path.exists(jp):
+            logging.warning(f"Resume: jsonl listed in manifest is missing: {jp}")
+            continue
+        with open(jp, "r", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                sample_id = rec.get("id")
+                if sample_id is not None:
+                    processed_ids.add(sample_id)
+    return next_idx, processed_ids
 
 
 def count_lines(path):
@@ -349,10 +396,12 @@ class HFDatasetAdapter(IterableDataset):
         hf_dataset,
         sample_rate: int = HIGGS_INPUT_SAMPLE_RATE,
         normalize_audio: bool = True,
+        skip_ids: set[str] | None = None,
     ):
         self.hf_dataset = hf_dataset
         self.sample_rate = sample_rate
         self.normalize_audio = normalize_audio
+        self.skip_ids = skip_ids or set()
 
     def __iter__(self):
         # Worker- and node-level sharding is handled by the HF dataset itself
@@ -360,9 +409,37 @@ class HFDatasetAdapter(IterableDataset):
         # `.shard(...)` applied before wrapping). Adding modulo skipping here
         # would compound with HF's auto-sharding and drop most samples.
         for sample in self.hf_dataset:
+            if self.skip_ids:
+                sample_id = self._peek_id(sample)
+                if sample_id is not None and sample_id in self.skip_ids:
+                    continue
             converted = self._convert_sample(sample)
             if converted is not None:
                 yield converted
+
+    def _peek_id(self, sample: dict[str, Any]) -> str | None:
+        """Extract sample id without decoding audio (for resume-time skipping)."""
+        json_meta = sample.get("json")
+        if isinstance(json_meta, bytes):
+            try:
+                json_meta = json.loads(json_meta.decode("utf-8"))
+            except Exception:
+                json_meta = {}
+        elif isinstance(json_meta, str):
+            try:
+                json_meta = json.loads(json_meta)
+            except Exception:
+                json_meta = {}
+        elif not isinstance(json_meta, dict):
+            json_meta = {}
+        for field in ("id", "__key__"):
+            value = sample.get(field)
+            if value is not None:
+                return value
+            value = json_meta.get(field)
+            if value is not None:
+                return value
+        return None
 
     def _convert_sample(self, sample: dict[str, Any]) -> dict[str, Any] | None:
         """Convert an HF dataset sample to {"audio": Tensor, "label": dict}."""
@@ -518,6 +595,42 @@ def main() -> None:
             0 <= args.machine_index < args.num_machines
         ), f"machine_index {args.machine_index} must be in [0, {args.num_machines})"
 
+    # Resolve output paths early so we can detect / parse resume state.
+    tar_output_pattern = str(Path(args.tar_output_pattern).expanduser())
+    jsonl_output_pattern = str(Path(args.jsonl_output_pattern).expanduser())
+    Path(tar_output_pattern).parent.mkdir(parents=True, exist_ok=True)
+    Path(jsonl_output_pattern).parent.mkdir(parents=True, exist_ok=True)
+    output_dir = Path(tar_output_pattern).parent.parent
+    error_log_path = str(output_dir / "errors.jsonl")
+    manifest_path = str(output_dir / "data.lst")
+
+    # Resume handling: parse existing data.lst before opening anything for write.
+    resume_skip_ids: set[str] = set()
+    resume_next_shard_idx = 0
+    manifest_exists = os.path.exists(manifest_path)
+    if args.resume:
+        if not args.dataset_name:
+            raise RuntimeError(
+                "--resume is only supported for HuggingFace dataset input "
+                "(--dataset_name)."
+            )
+        if manifest_exists:
+            logging.info(f"Resume: parsing existing manifest {manifest_path}")
+            resume_next_shard_idx, resume_skip_ids = parse_resume_state(manifest_path)
+            logging.info(
+                f"Resume: next shard idx = {resume_next_shard_idx}, "
+                f"already-processed samples = {len(resume_skip_ids)}"
+            )
+        else:
+            logging.info(
+                f"Resume: no existing manifest at {manifest_path}; starting fresh."
+            )
+    elif manifest_exists:
+        raise RuntimeError(
+            f"{manifest_path} already exists. Pass --resume to continue from it, "
+            f"or remove the file to start over."
+        )
+
     # Build base dataset and count total samples based on input mode
     if args.input_jsonl:
         logging.info(f"Input mode: raw JSONL ({args.input_jsonl})")
@@ -661,8 +774,13 @@ def main() -> None:
             hf_dataset,
             sample_rate=HIGGS_INPUT_SAMPLE_RATE,
             normalize_audio=True,
+            skip_ids=resume_skip_ids,
         )
         loader_workers = args.loader_workers
+        # Account for already-processed samples in the progress total so the
+        # bar reflects only the remaining work.
+        if total_samples is not None and resume_skip_ids:
+            total_samples = max(0, total_samples - len(resume_skip_ids))
 
     # Adjust samples_per_shard if min_num_shards would be violated
     samples_per_shard = args.samples_per_shard
@@ -714,22 +832,16 @@ def main() -> None:
         for _ in range(num_processes):
             rank_queue.put(-1)
 
-    # Prepare output paths
-    tar_output_pattern = str(Path(args.tar_output_pattern).expanduser())
-    jsonl_output_pattern = str(Path(args.jsonl_output_pattern).expanduser())
-    Path(tar_output_pattern).parent.mkdir(parents=True, exist_ok=True)
-    Path(jsonl_output_pattern).parent.mkdir(parents=True, exist_ok=True)
-
-    # Determine output directory from tar_output_pattern
-    output_dir = Path(tar_output_pattern).parent.parent
-    error_log_path = str(output_dir / "errors.jsonl")
-    manifest_path = str(output_dir / "data.lst")
+    # Output paths were resolved above (before resume parsing).
+    file_open_mode = "a" if args.resume and manifest_exists else "w"
 
     # Setup error logger (writes to errors.jsonl)
     error_logger = logging.getLogger("error_log")
     error_logger.setLevel(logging.ERROR)
     error_logger.handlers.clear()
-    error_fh = logging.FileHandler(error_log_path, mode="w", encoding="utf-8")
+    error_fh = logging.FileHandler(
+        error_log_path, mode=file_open_mode, encoding="utf-8"
+    )
     error_fh.setFormatter(logging.Formatter("%(message)s"))
     error_logger.addHandler(error_fh)
 
@@ -738,14 +850,14 @@ def main() -> None:
     error_count = 0
     write_error_count = 0
     failed_ids = []
-    shard_idx = 0
+    shard_idx = resume_next_shard_idx
     shard_sample_count = 0
     shard_duration = 0.0
     shard_manifest_count = 0
 
     tar_writer = None
     jsonl_file = None
-    manifest_file = open(manifest_path, "w", encoding="utf-8")
+    manifest_file = open(manifest_path, file_open_mode, encoding="utf-8")
 
     def append_shard_to_manifest(idx: int, sample_count: int, duration: float) -> None:
         nonlocal shard_manifest_count
