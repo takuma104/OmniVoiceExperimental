@@ -40,14 +40,49 @@ import json
 import logging
 import os
 import random
+import shlex
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
+import numpy as np
 import torch
 import torch.distributed as dist
 import webdataset as wds
 
 from omnivoice.utils.audio import load_audio, load_audio_bytes
 from torch.utils.data import IterableDataset
+
+
+@dataclass(frozen=True)
+class WebDatasetShard:
+    """One WebDataset shard entry used by the training reader."""
+
+    url: str
+    label_path: Optional[str]
+    num_items: int
+    num_seconds: float
+    format: str = "legacy"
+    s3_url_mode: Optional[str] = None
+
+
+def _is_remote_or_pipe(path: str) -> bool:
+    return path.startswith(("s3://", "http://", "https://", "gs://", "pipe:"))
+
+
+def _resolve_config_path(path: str, data_config_path: Path) -> str:
+    if _is_remote_or_pipe(path) or os.path.isabs(path):
+        return path
+    cwd_path = Path(path)
+    if cwd_path.exists():
+        return str(cwd_path)
+    return str(data_config_path.parent / path)
+
+
+def _normalise_wds_url(url: str, s3_url_mode: Optional[str] = None) -> str:
+    if url.startswith("s3://") and s3_url_mode == "awscli_pipe":
+        return f"pipe:aws s3 cp {shlex.quote(url)} -"
+    return url
 
 
 def load_audio_webdataset(data, sample_rate: int = 24000, device="cpu"):
@@ -62,7 +97,7 @@ def load_audio_webdataset(data, sample_rate: int = 24000, device="cpu"):
 
 def prepare_data_manifests_from_json(
     data_config: str,
-) -> Tuple[List[Tuple[str, str, int, float]], List[Tuple[str, str, int, float]]]:
+) -> Tuple[List[Any], List[Any]]:
     """
     Prepare data manifests from a json file.
     A typical multilingual json file is in the following format:
@@ -128,36 +163,98 @@ def prepare_data_manifests_from_json(
             }
         ]
 
-    data.lst format (items separated by space):
+    Legacy data.lst format (items separated by space):
     /path/to/data.tar /path/to/label.jsonl num_items num_seconds
+
+    WebDataset v2 can also be specified directly in data_config without a
+    sidecar jsonl file:
+    {
+        "train": [
+            {
+                "format": "webdataset_v2",
+                "urls": ["s3://bucket/path/shard-{000000..000127}.tar"],
+                "num_items": 128000,
+                "num_seconds": 410000.0,
+                "s3_url_mode": "awscli_pipe",
+                "repeat": 1
+            }
+        ]
+    }
     """
-    train_manifests = []
-    dev_manifests = []
-    with open(data_config, "r", encoding="utf-8") as f:
+    data_config_path = Path(data_config)
+    with open(data_config_path, "r", encoding="utf-8") as f:
         data = json.load(f)
-        for item in data["train"]:
+
+    def parse_split(split: str) -> List[Any]:
+        manifests: List[Any] = []
+        for item in data.get(split, []):
+            repeat = int(item.get("repeat", 1))
+            dataset_format = item.get("format") or item.get("dataset_format")
+
+            if "urls" in item or "shards" in item:
+                format_name = dataset_format or "webdataset_v2"
+                s3_url_mode = item.get("s3_url_mode")
+                shard_entries = []
+                if "shards" in item:
+                    for shard in item["shards"]:
+                        shard_entries.append(
+                            WebDatasetShard(
+                                url=_normalise_wds_url(
+                                    shard["url"], shard.get("s3_url_mode", s3_url_mode)
+                                ),
+                                label_path=None,
+                                num_items=int(shard.get("num_items", 0)),
+                                num_seconds=float(shard.get("num_seconds", 0.0)),
+                                format=format_name,
+                                s3_url_mode=shard.get("s3_url_mode", s3_url_mode),
+                            )
+                        )
+                else:
+                    urls = item["urls"]
+                    if isinstance(urls, str):
+                        urls = [urls]
+                    total_items = int(item.get("num_items", 0))
+                    total_seconds = float(item.get("num_seconds", 0.0))
+                    for index, url in enumerate(urls):
+                        # Store aggregate stats on the first URL. They are used
+                        # only for length/weight estimates, not for sampling.
+                        shard_entries.append(
+                            WebDatasetShard(
+                                url=_normalise_wds_url(url, s3_url_mode),
+                                label_path=None,
+                                num_items=total_items if index == 0 else 0,
+                                num_seconds=total_seconds if index == 0 else 0.0,
+                                format=format_name,
+                                s3_url_mode=s3_url_mode,
+                            )
+                        )
+                for _ in range(repeat):
+                    manifests.extend(shard_entries)
+                continue
+
             manifest_paths = item["manifest_path"]
-            repeat = item.get("repeat", 1)
+            if isinstance(manifest_paths, str):
+                manifest_paths = [manifest_paths]
             for manifest_path in manifest_paths:
-                # assert manifest_path is a file
-                assert os.path.isfile(manifest_path), f"{manifest_path} is not a file."
-                train_manifests.extend(
-                    webdataset_manifest_reader(manifest_path) * repeat
-                )
-        if "dev" in data:
-            for item in data["dev"]:
-                manifest_paths = item["manifest_path"]
-                repeat = item.get("repeat", 1)
-                for manifest_path in manifest_paths:
-                    dev_manifests.extend(
-                        webdataset_manifest_reader(manifest_path) * repeat
+                manifest_path = _resolve_config_path(manifest_path, data_config_path)
+                if _is_remote_or_pipe(manifest_path):
+                    raise ValueError(
+                        "Remote legacy data.lst files are not supported. "
+                        "Use webdataset_v2 with a urls field instead: "
+                        f"{manifest_path}"
                     )
+                assert os.path.isfile(manifest_path), f"{manifest_path} is not a file."
+                manifests.extend(webdataset_manifest_reader(manifest_path) * repeat)
+        return manifests
+
+    train_manifests = parse_split("train")
+    dev_manifests = parse_split("dev")
     return train_manifests, dev_manifests
 
 
 def webdataset_manifest_reader(
     manifest_path: str,
-) -> List[Tuple[str, str]]:
+) -> List[Tuple[str, str, int, float]]:
     """
     Read a manifest file containing webdataset tar paths and label jsonl paths.
     Each line in the manifest file is in the format of:
@@ -186,6 +283,35 @@ def webdataset_manifest_reader(
     return manifests
 
 
+def _numpy_from_value(value: Any) -> np.ndarray:
+    if isinstance(value, np.ndarray):
+        return value
+    if isinstance(value, torch.Tensor):
+        return value.cpu().numpy()
+    if isinstance(value, bytes):
+        return np.load(io.BytesIO(value), allow_pickle=False)
+    if isinstance(value, str):
+        return np.load(value, allow_pickle=False)
+    return np.asarray(value)
+
+
+def _json_from_value(value: Any) -> Dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, bytes):
+        value = value.decode("utf-8")
+    if isinstance(value, str):
+        return json.loads(value)
+    raise TypeError(f"Unsupported JSON payload type: {type(value)!r}")
+
+
+def _get_first_sample_value(sample: Dict[str, Any], keys: Tuple[str, ...]) -> Any:
+    for key in keys:
+        if key in sample:
+            return sample[key]
+    return None
+
+
 class SampleDecoder:
     """
     Decode a sample from webdataset, including loading audio/tokens and fetching label.
@@ -193,7 +319,7 @@ class SampleDecoder:
 
     def __init__(
         self,
-        tar_to_label: Dict,
+        tar_to_label: Optional[Dict[str, str]] = None,
         sample_rate: int = 24000,
         audio_format: Optional[Tuple[str]] = None,
         normalize_audio: bool = True,
@@ -207,7 +333,7 @@ class SampleDecoder:
           audio_format:
             Tuple of audio file extensions to look for in the sample.
         """
-        self.tar_to_label = tar_to_label
+        self.tar_to_label = tar_to_label or {}
         self.sample_rate = sample_rate
         self.label_dataset = None
         if audio_format is None:
@@ -220,15 +346,18 @@ class SampleDecoder:
         return_dict = {}
         src = sample["__url__"]
         key = sample["__key__"]
-        if (
-            self.label_dataset is None
-            or self.label_dataset.path != self.tar_to_label[src]
-        ):
-            self.label_dataset = LabelDataset(self.tar_to_label[src])
 
         audio = torch.empty(0)
-        if "npy" in sample:
-            audio_tokens = torch.from_numpy(sample["npy"])
+        audio_tokens_value = _get_first_sample_value(
+            sample,
+            (
+                "audio_tokens.npy",
+                "audio_tokens",
+                "npy",
+            ),
+        )
+        if audio_tokens_value is not None:
+            audio_tokens = torch.from_numpy(_numpy_from_value(audio_tokens_value))
             return_dict["audio_tokens"] = audio_tokens
         else:
             for ext in self.audio_format:
@@ -243,7 +372,39 @@ class SampleDecoder:
             return_dict["audio"] = audio
             return_dict["audio_duration"] = audio.size(-1) / self.sample_rate
 
-        label = self.label_dataset[key]
+        label_value = _get_first_sample_value(sample, ("json", "metadata.json"))
+        if label_value is not None:
+            label = _json_from_value(label_value)
+        else:
+            label_path = self.tar_to_label.get(src)
+            if label_path is None:
+                raise KeyError(
+                    f"No embedded label and no sidecar label for sample {key} "
+                    f"from {src}"
+                )
+            if self.label_dataset is None or self.label_dataset.path != label_path:
+                self.label_dataset = LabelDataset(label_path)
+            label = self.label_dataset[key]
+
+        label.setdefault("id", key)
+
+        text_ids_value = _get_first_sample_value(sample, ("text_ids.npy", "text_ids"))
+        if text_ids_value is not None:
+            label["text_ids"] = _numpy_from_value(text_ids_value)
+
+        text_pinyin_ids_value = _get_first_sample_value(
+            sample,
+            ("text_pinyin_ids.npy", "text_pinyin_ids"),
+        )
+        if text_pinyin_ids_value is not None:
+            label["text_pinyin_ids"] = _numpy_from_value(text_pinyin_ids_value)
+
+        timestamp_value = _get_first_sample_value(
+            sample,
+            ("timestamp.json", "timestamps.json", "timestamp"),
+        )
+        if timestamp_value is not None:
+            return_dict["timestamp"] = _json_from_value(timestamp_value)
 
         return_dict["label"] = label
         return return_dict
@@ -317,17 +478,43 @@ class WebDatasetReader(IterableDataReader):
         self.tar_to_label = {}
         self.num_items = 0
         self.num_seconds = 0.0
-        for tar_path, label_jsonl_path, num_items, num_seconds in manifests:
-            self.orig_urls.append(tar_path)
-            self.tar_to_label[tar_path] = label_jsonl_path
-            self.num_items += num_items
-            self.num_seconds += num_seconds
+        for manifest in manifests:
+            shard = self._coerce_shard(manifest)
+            self.orig_urls.append(shard.url)
+            if shard.label_path is not None:
+                self.tar_to_label[shard.url] = shard.label_path
+            self.num_items += shard.num_items
+            self.num_seconds += shard.num_seconds
         self.urls = self.orig_urls.copy()
         self.sample_decoder = SampleDecoder(
             tar_to_label=self.tar_to_label,
             sample_rate=sample_rate,
         )
         self.sample_rate = sample_rate
+
+    def _coerce_shard(self, manifest: Any) -> WebDatasetShard:
+        if isinstance(manifest, WebDatasetShard):
+            return manifest
+        if isinstance(manifest, dict):
+            url = manifest.get("url") or manifest.get("tar_path")
+            if url is None:
+                raise ValueError(f"Invalid WebDataset manifest entry: {manifest!r}")
+            return WebDatasetShard(
+                url=_normalise_wds_url(url, manifest.get("s3_url_mode")),
+                label_path=manifest.get("label_path") or manifest.get("label_jsonl_path"),
+                num_items=int(manifest.get("num_items", 0)),
+                num_seconds=float(manifest.get("num_seconds", 0.0)),
+                format=manifest.get("format", "legacy"),
+                s3_url_mode=manifest.get("s3_url_mode"),
+            )
+        tar_path, label_jsonl_path, num_items, num_seconds = manifest
+        return WebDatasetShard(
+            url=tar_path,
+            label_path=label_jsonl_path,
+            num_items=int(num_items),
+            num_seconds=float(num_seconds),
+            format="legacy",
+        )
 
     def set_epoch(self, epoch: int):
         """
@@ -348,7 +535,7 @@ class WebDatasetReader(IterableDataReader):
             empty_check=False,
         )
 
-        pipeline = dataset.decode().map(self.sample_decoder)
+        pipeline = dataset.map(self.sample_decoder)
         if not self.evaluation:
             pipeline = pipeline.shuffle(self.shuffle_buffer_size, seed=self.epoch)
         return iter(pipeline)

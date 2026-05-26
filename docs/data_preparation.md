@@ -1,6 +1,10 @@
 # Data Preparation
 
-OmniVoice trains on a custom WebDataset format where audio data is packed into **tar shards** with paired **JSONL metadata** files. Each tar shard contains hundreds to thousands of samples (as `.npy` audio token arrays), drastically reducing disk I/O during training. The separated jsonl file allows for easier modification of metadata. This document explains the data format in detail and walks through the preparation pipeline.
+OmniVoice trains on WebDataset tar shards. The legacy format stores audio token
+arrays in tar shards with paired JSONL metadata files. The v2 format stores audio
+tokens, tokenized text ids, and metadata inside the same tar shard, which makes
+the dataset self-contained and suitable for direct training from object storage
+such as S3.
 
 
 ## 1. Input Format
@@ -39,6 +43,22 @@ What it does:
 2. Encodes each audio file into discrete tokens using audio tokenizer
 3. Packs tokens into WebDataset tar shards with paired jsonl metadata files
 4. Generates a `data.lst` manifest file
+
+To write self-contained v2 shards directly, add `--output_format webdataset_v2`
+and provide the text tokenizer used by training:
+
+```bash
+python -m omnivoice.scripts.extract_audio_tokens \
+    --input_jsonl data.jsonl \
+    --tar_output_pattern output_v2/shards/shard-%06d.tar \
+    --output_format webdataset_v2 \
+    --text_tokenizer_path Qwen/Qwen3-0.6B \
+    --tokenizer_path eustlb/higgs-audio-v2-tokenizer \
+    --data_config_split train \
+    --language_id en
+```
+
+This writes `output_v2/data_v2.json`, which can be passed to `--data_config`.
 
 <details>
 <summary><strong>Alternative:</strong> WebDataset Input (if you already have raw-audio tar shards)</summary>
@@ -178,5 +198,73 @@ After creating WebDataset shards, write a data config JSON that references them:
 - `language_id` is not used, just for a better data organization.
 
 See [examples/config/](../examples/config/) for ready-to-use data config files.
+
+### WebDataset v2
+
+Each v2 tar sample is self-contained:
+
+```
+sample_001.audio_tokens.npy     # Audio tokens [8, T], int16
+sample_001.text_ids.npy         # Raw transcript token ids, int32
+sample_001.text_pinyin_ids.npy  # Optional pinyin token ids, int32
+sample_001.json                 # Metadata: id, language_id, duration, etc.
+sample_001.timestamp.json       # Optional ASR timestamp labels
+```
+
+`text_ids.npy` does not include `<|text_start|>` or `<|text_end|>`. The training
+processor adds those with the runtime tokenizer, so the dataset is less coupled
+to a particular special-token layout.
+
+Example local v2 data config:
+
+```json
+{
+    "train": [
+        {
+            "format": "webdataset_v2",
+            "urls": ["data/custom/tokens_v2/train/shard-{000000..000127}.tar"],
+            "num_items": 128000,
+            "num_seconds": 410000.0,
+            "repeat": 1
+        }
+    ]
+}
+```
+
+Example S3 data config:
+
+```json
+{
+    "train": [
+        {
+            "format": "webdataset_v2",
+            "urls": ["s3://my-bucket/omnivoice/train/shard-{000000..000127}.tar"],
+            "s3_url_mode": "awscli_pipe",
+            "num_items": 128000,
+            "num_seconds": 410000.0,
+            "repeat": 1
+        }
+    ]
+}
+```
+
+With `s3_url_mode: "awscli_pipe"`, the reader opens each S3 shard through
+`aws s3 cp ... -`, so the training environment needs AWS credentials and the
+AWS CLI installed.
+
+### Convert legacy shards to v2
+
+Convert an existing legacy `data_config`:
+
+```bash
+python -m omnivoice.scripts.convert_legacy_webdataset_to_v2 \
+    --input_data_config output_asr/run0/data.json \
+    --output_dir output_asr/run0/data_v2 \
+    --text_tokenizer_path output_asr/run0/checkpoint-1000
+```
+
+The converter writes `data_v2/data_v2.json`. Use `--url_prefix
+s3://my-bucket/path` after uploading the generated shard directory to produce an
+S3-ready data config.
 
 > See [docs/data_preparation_advanced.md](../docs/data_preparation_advanced.md) for denoising and noise augmentation.

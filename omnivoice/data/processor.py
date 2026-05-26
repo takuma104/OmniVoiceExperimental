@@ -33,6 +33,47 @@ from typing import Any, Dict
 import torch
 
 
+def _to_1d_long_tensor(value: Any) -> torch.Tensor:
+    tensor = torch.as_tensor(value, dtype=torch.long)
+    if tensor.dim() == 2 and tensor.size(0) == 1:
+        tensor = tensor.squeeze(0)
+    if tensor.dim() != 1:
+        raise ValueError(f"Expected 1-D token ids, got shape {tuple(tensor.shape)}")
+    return tensor
+
+
+def _tokenize_without_added_special_tokens(tokenizer: Any, text: str) -> torch.Tensor:
+    try:
+        return tokenizer(
+            text,
+            add_special_tokens=False,
+            return_tensors="pt",
+        ).input_ids.squeeze(0).long()
+    except TypeError:
+        return tokenizer(text, return_tensors="pt").input_ids.squeeze(0).long()
+
+
+def _marked_text_inputs_from_ids(tokenizer: Any, text_ids: Any) -> torch.Tensor:
+    body_ids = _to_1d_long_tensor(text_ids)
+    start_ids = _tokenize_without_added_special_tokens(tokenizer, "<|text_start|>")
+    end_ids = _tokenize_without_added_special_tokens(tokenizer, "<|text_end|>")
+    return torch.cat([start_ids, body_ids, end_ids], dim=0).unsqueeze(0)
+
+
+def _build_text_inputs(
+    tokenizer: Any,
+    label: Dict[str, Any],
+    text_key: str = "text",
+    ids_key: str = "text_ids",
+) -> torch.Tensor:
+    if ids_key in label:
+        return _marked_text_inputs_from_ids(tokenizer, label[ids_key])
+    text = label[text_key]
+    return tokenizer(
+        f"<|text_start|>{text}<|text_end|>", return_tensors="pt"
+    ).input_ids
+
+
 class OmniVoiceSampleProcessor:
     """
     Handles the logic of processing a raw sample into tensors
@@ -116,15 +157,20 @@ class OmniVoiceSampleProcessor:
 
         # --- Text ---
         if (
-            "text_pinyin" in sample["label"]
+            ("text_pinyin" in sample["label"] or "text_pinyin_ids" in sample["label"])
             and random.uniform(0, 1) < self.use_pinyin_ratio
         ):
-            text = sample["label"]["text_pinyin"]
+            text_inputs = _build_text_inputs(
+                self.text_tokenizer,
+                sample["label"],
+                text_key="text_pinyin",
+                ids_key="text_pinyin_ids",
+            ).repeat(self.num_channels, 1)
         else:
-            text = sample["label"]["text"]
-        text_inputs = self.text_tokenizer(
-            f"<|text_start|>{text}<|text_end|>", return_tensors="pt"
-        ).input_ids.repeat(self.num_channels, 1)
+            text_inputs = _build_text_inputs(
+                self.text_tokenizer,
+                sample["label"],
+            ).repeat(self.num_channels, 1)
         text_labels = torch.full(text_inputs.shape, -100)  # Text does not compute loss
 
         # --- Audio ---
@@ -211,10 +257,10 @@ class OmniVoiceSimpleSampleProcessor:
             prompt_ratio = random.uniform(*self.prompt_ratio_range)
 
         # --- Text ---
-        text = sample["label"]["text"]
-        text_inputs = self.text_tokenizer(
-            f"<|text_start|>{text}<|text_end|>", return_tensors="pt"
-        ).input_ids.repeat(self.num_channels, 1)
+        text_inputs = _build_text_inputs(
+            self.text_tokenizer,
+            sample["label"],
+        ).repeat(self.num_channels, 1)
         text_labels = torch.full(text_inputs.shape, -100)  # Text does not compute loss
 
         # --- Audio ---
@@ -299,10 +345,7 @@ class OmniVoiceASRSampleProcessor:
                 f"got {audio_tokens.size(0)}"
             )
 
-        text = label["text"]
-        text_ids = self.text_tokenizer(
-            f"<|text_start|>{text}<|text_end|>", return_tensors="pt"
-        ).input_ids
+        text_ids = _build_text_inputs(self.text_tokenizer, label)
         text_inputs = text_ids.repeat(self.num_channels, 1)
 
         input_ids = torch.cat([style_inputs, audio_tokens, text_inputs], dim=1)

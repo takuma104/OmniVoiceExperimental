@@ -112,6 +112,13 @@ def _load_timestamps_from_data_config(
     return timestamps
 
 
+def _data_config_has_embedded_timestamps(data_config: str, split: str) -> bool:
+    data_config_path = Path(data_config)
+    with data_config_path.open("r", encoding="utf-8") as f:
+        data = json.load(f)
+    return any(item.get("timestamps_embedded") for item in data.get(split, []))
+
+
 def _add_asr_special_tokens(tokenizer):
     new_tokens = [
         "<|asr|>",
@@ -266,7 +273,7 @@ def build_asr_dataloaders(
         train_timestamps = _load_timestamps_from_data_config(config.data_config, "train")
         if train_timestamps:
             raw_train_ds = TimestampWrappedReader(raw_train_ds, train_timestamps)
-        else:
+        elif not _data_config_has_embedded_timestamps(config.data_config, "train"):
             logger.warning(
                 "asr_enable_timestamp_head is true, but no train timestamp_path "
                 "entries were found in data_config."

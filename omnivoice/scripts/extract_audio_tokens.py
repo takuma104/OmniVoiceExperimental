@@ -72,7 +72,7 @@ import webdataset as wds
 from datasets import load_dataset
 from torch.utils.data import DataLoader, IterableDataset
 from tqdm.auto import tqdm
-from transformers import AutoFeatureExtractor, HiggsAudioV2TokenizerModel
+from transformers import AutoFeatureExtractor, AutoTokenizer, HiggsAudioV2TokenizerModel
 
 from omnivoice.data.dataset import (
     JsonlDatasetReader,
@@ -145,8 +145,38 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--jsonl_output_pattern",
-        required=True,
-        help="Jsonl shard pattern passed to WebDataset",
+        default=None,
+        help="Jsonl shard pattern passed to WebDataset (legacy output only)",
+    )
+    parser.add_argument(
+        "--output_format",
+        choices=["legacy", "webdataset_v2"],
+        default="legacy",
+        help="legacy writes tar + sidecar JSONL; webdataset_v2 embeds metadata "
+        "and tokenized text in the tar shard.",
+    )
+    parser.add_argument(
+        "--text_tokenizer_path",
+        type=str,
+        default=None,
+        help="Text tokenizer/checkpoint used for webdataset_v2 text_ids.",
+    )
+    parser.add_argument(
+        "--store_raw_text",
+        type=str2bool,
+        default=True,
+        help="Keep raw text/text_pinyin in webdataset_v2 metadata.",
+    )
+    parser.add_argument(
+        "--data_config_split",
+        choices=["train", "dev"],
+        default="train",
+        help="Split name used in generated webdataset_v2 data_v2.json.",
+    )
+    parser.add_argument(
+        "--language_id",
+        default=None,
+        help="Optional language_id written to generated webdataset_v2 data_v2.json.",
     )
     parser.add_argument(
         "--samples_per_shard",
@@ -283,6 +313,52 @@ def serialise_numpy(key: str, tokens: np.ndarray) -> dict:
     buffer = io.BytesIO()
     np.save(buffer, tokens)
     return {"__key__": key, "npy": buffer.getvalue()}
+
+
+def serialise_numpy_bytes(tokens: np.ndarray) -> bytes:
+    buffer = io.BytesIO()
+    np.save(buffer, tokens)
+    return buffer.getvalue()
+
+
+def tokenize_text_ids(text_tokenizer, text: str) -> np.ndarray:
+    ids = text_tokenizer(text, add_special_tokens=False).input_ids
+    return np.asarray(ids, dtype=np.int32)
+
+
+def build_v2_record(
+    key: str,
+    audio_tokens_np: np.ndarray,
+    metadata: dict[str, Any],
+    text_tokenizer,
+    store_raw_text: bool,
+) -> dict[str, Any]:
+    if "text" not in metadata:
+        raise ValueError(f"Sample {key} is missing text for webdataset_v2 output.")
+
+    record = {
+        "__key__": key,
+        "audio_tokens.npy": serialise_numpy_bytes(audio_tokens_np),
+        "text_ids.npy": serialise_numpy_bytes(
+            tokenize_text_ids(text_tokenizer, str(metadata["text"]))
+        ),
+    }
+    if metadata.get("text_pinyin") is not None:
+        record["text_pinyin_ids.npy"] = serialise_numpy_bytes(
+            tokenize_text_ids(text_tokenizer, str(metadata["text_pinyin"]))
+        )
+
+    cleaned = {
+        meta_key: _normalise_value(value)
+        for meta_key, value in metadata.items()
+        if value is not None
+        and (store_raw_text or meta_key not in {"text", "text_pinyin"})
+    }
+    cleaned["format_version"] = 2
+    cleaned["num_audio_tokens"] = int(audio_tokens_np.shape[1])
+    cleaned["num_audio_codebook"] = int(audio_tokens_np.shape[0])
+    record["json"] = json.dumps(cleaned, ensure_ascii=False).encode("utf-8")
+    return record
 
 
 def process_init(rank_queue, tokenizer_path):
@@ -590,6 +666,20 @@ def main() -> None:
         sum(input_modes) == 1
     ), "Exactly one of --input_manifest, --input_jsonl, or --dataset_name must be provided."
 
+    if args.output_format == "legacy" and not args.jsonl_output_pattern:
+        raise ValueError("--jsonl_output_pattern is required for legacy output.")
+    if args.output_format == "webdataset_v2":
+        if args.jsonl_output_pattern:
+            logging.warning(
+                "--jsonl_output_pattern is ignored when --output_format=webdataset_v2"
+            )
+        if args.resume:
+            raise ValueError("--resume is not supported for webdataset_v2 output.")
+        if args.text_tokenizer_path is None:
+            raise ValueError(
+                "--text_tokenizer_path is required for webdataset_v2 output."
+            )
+
     if args.num_machines > 1:
         assert (
             0 <= args.machine_index < args.num_machines
@@ -597,12 +687,27 @@ def main() -> None:
 
     # Resolve output paths early so we can detect / parse resume state.
     tar_output_pattern = str(Path(args.tar_output_pattern).expanduser())
-    jsonl_output_pattern = str(Path(args.jsonl_output_pattern).expanduser())
+    jsonl_output_pattern = (
+        str(Path(args.jsonl_output_pattern).expanduser())
+        if args.jsonl_output_pattern
+        else None
+    )
     Path(tar_output_pattern).parent.mkdir(parents=True, exist_ok=True)
-    Path(jsonl_output_pattern).parent.mkdir(parents=True, exist_ok=True)
-    output_dir = Path(tar_output_pattern).parent.parent
+    if jsonl_output_pattern:
+        Path(jsonl_output_pattern).parent.mkdir(parents=True, exist_ok=True)
+    if args.output_format == "legacy" or Path(tar_output_pattern).parent.name in {
+        "audios",
+        "shards",
+    }:
+        output_dir = Path(tar_output_pattern).parent.parent
+    else:
+        output_dir = Path(tar_output_pattern).parent
     error_log_path = str(output_dir / "errors.jsonl")
-    manifest_path = str(output_dir / "data.lst")
+    manifest_path = (
+        str(output_dir / "data.lst")
+        if args.output_format == "legacy"
+        else str(output_dir / "data_v2.json")
+    )
 
     # Resume handling: parse existing data.lst before opening anything for write.
     resume_skip_ids: set[str] = set()
@@ -834,6 +939,11 @@ def main() -> None:
 
     # Output paths were resolved above (before resume parsing).
     file_open_mode = "a" if args.resume and manifest_exists else "w"
+    text_tokenizer = (
+        AutoTokenizer.from_pretrained(args.text_tokenizer_path)
+        if args.output_format == "webdataset_v2"
+        else None
+    )
 
     # Setup error logger (writes to errors.jsonl)
     error_logger = logging.getLogger("error_log")
@@ -854,18 +964,31 @@ def main() -> None:
     shard_sample_count = 0
     shard_duration = 0.0
     shard_manifest_count = 0
+    total_written_duration = 0.0
 
     tar_writer = None
     jsonl_file = None
-    manifest_file = open(manifest_path, file_open_mode, encoding="utf-8")
+    manifest_file = (
+        open(manifest_path, file_open_mode, encoding="utf-8")
+        if args.output_format == "legacy"
+        else None
+    )
+    v2_urls = []
 
     def append_shard_to_manifest(idx: int, sample_count: int, duration: float) -> None:
-        nonlocal shard_manifest_count
+        nonlocal shard_manifest_count, total_written_duration
         tar_path = os.path.abspath(tar_output_pattern % idx)
-        jsonl_path = os.path.abspath(jsonl_output_pattern % idx)
-        manifest_file.write(f"{tar_path} {jsonl_path} {sample_count} {duration:.3f}\n")
-        manifest_file.flush()
-        os.fsync(manifest_file.fileno())
+        if args.output_format == "legacy":
+            assert manifest_file is not None and jsonl_output_pattern is not None
+            jsonl_path = os.path.abspath(jsonl_output_pattern % idx)
+            manifest_file.write(
+                f"{tar_path} {jsonl_path} {sample_count} {duration:.3f}\n"
+            )
+            manifest_file.flush()
+            os.fsync(manifest_file.fileno())
+        else:
+            v2_urls.append(tar_path)
+        total_written_duration += duration
         shard_manifest_count += 1
 
     def open_new_shard():
@@ -880,23 +1003,38 @@ def main() -> None:
             prev_idx = shard_idx - 1
             append_shard_to_manifest(prev_idx, shard_sample_count, shard_duration)
         tar_fname = tar_output_pattern % shard_idx
-        jsonl_fname = jsonl_output_pattern % shard_idx
         tar_writer = wds.TarWriter(tar_fname)
-        jsonl_file = open(jsonl_fname, "w", encoding="utf-8")
+        if args.output_format == "legacy":
+            assert jsonl_output_pattern is not None
+            jsonl_fname = jsonl_output_pattern % shard_idx
+            jsonl_file = open(jsonl_fname, "w", encoding="utf-8")
         shard_idx += 1
         shard_sample_count = 0
         shard_duration = 0.0
 
     def write_sample(key, audio_tokens_np, metadata):
         nonlocal shard_sample_count, write_error_count, shard_duration
-        assert tar_writer is not None and jsonl_file is not None
+        assert tar_writer is not None
         try:
-            token_record = serialise_numpy(key, audio_tokens_np)
-            json_record = _encode_metadata(metadata)
-            tar_writer.write(token_record)
-            jsonl_file.write(json_record.decode("utf-8") + "\n")
+            if args.output_format == "legacy":
+                assert jsonl_file is not None
+                token_record = serialise_numpy(key, audio_tokens_np)
+                json_record = _encode_metadata(metadata)
+                tar_writer.write(token_record)
+                jsonl_file.write(json_record.decode("utf-8") + "\n")
+            else:
+                assert text_tokenizer is not None
+                tar_writer.write(
+                    build_v2_record(
+                        key=key,
+                        audio_tokens_np=audio_tokens_np,
+                        metadata=metadata,
+                        text_tokenizer=text_tokenizer,
+                        store_raw_text=args.store_raw_text,
+                    )
+                )
             shard_sample_count += 1
-            shard_duration += metadata.get("audio_duration", 0.0)
+            shard_duration += float(metadata.get("audio_duration", 0.0) or 0.0)
         except Exception as exc:
             write_error_count += 1
             failed_ids.append(key)
@@ -983,7 +1121,21 @@ def main() -> None:
         if shard_idx > 0 and shard_sample_count > 0:
             last_idx = shard_idx - 1
             append_shard_to_manifest(last_idx, shard_sample_count, shard_duration)
-        manifest_file.close()
+        if manifest_file is not None:
+            manifest_file.close()
+
+        if args.output_format == "webdataset_v2":
+            data_item = {
+                "format": "webdataset_v2",
+                "urls": v2_urls,
+                "num_items": max(0, processed_count - write_error_count),
+                "num_seconds": total_written_duration,
+                "repeat": 1,
+            }
+            if args.language_id is not None:
+                data_item["language_id"] = args.language_id
+            with open(manifest_path, "w", encoding="utf-8") as f:
+                json.dump({args.data_config_split: [data_item]}, f, indent=4)
 
     # Output final statistics
     total_failed = error_count + write_error_count
